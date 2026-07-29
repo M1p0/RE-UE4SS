@@ -173,6 +173,15 @@ namespace RC
         constexpr static File::CharType section_memory[] = STR("Memory");
         REGISTER_INT64_SETTING(Memory.MaxMemoryUsageDuringAssetLoading, section_memory, MaxMemoryUsageDuringAssetLoading)
 
+        constexpr static File::CharType section_mcp[] = STR("MCP");
+        REGISTER_BOOL_SETTING(MCP.Enabled, section_mcp, Enabled)
+        REGISTER_STRING_SETTING(MCP.PipeName, section_mcp, PipeName)
+        REGISTER_STRING_SETTING(MCP.AuthToken, section_mcp, AuthToken)
+        REGISTER_BOOL_SETTING(MCP.AllowLuaEval, section_mcp, AllowLuaEval)
+        REGISTER_INT64_SETTING(MCP.MaxResultCount, section_mcp, MaxResultCount)
+        REGISTER_INT64_SETTING(MCP.MaxSerializeDepth, section_mcp, MaxSerializeDepth)
+        REGISTER_BOOL_SETTING(MCP.AuditLogEnabled, section_mcp, AuditLogEnabled)
+
         constexpr static File::CharType section_hooks[] = STR("Hooks");
         REGISTER_BOOL_SETTING(Hooks.HookProcessInternal, section_hooks, HookProcessInternal)
         REGISTER_BOOL_SETTING(Hooks.HookProcessLocalScriptFunction, section_hooks, HookProcessLocalScriptFunction)

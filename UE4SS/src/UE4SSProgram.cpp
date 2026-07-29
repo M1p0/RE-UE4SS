@@ -26,6 +26,7 @@
 #include <Helpers/Time.hpp>
 #include <IniParser/Ini.hpp>
 #include <LuaLibrary.hpp>
+#include <MCP/MCPServer.hpp>
 #include <LuaType/LuaCustomProperty.hpp>
 #include <LuaType/LuaUObject.hpp>
 #include <Mod/CppMod.hpp>
@@ -389,6 +390,8 @@ namespace RC
 
     UE4SSProgram::~UE4SSProgram()
     {
+        MCP::Server::Get().stop();
+
         // Shut down the event loop
         m_processing_events = false;
 
@@ -1077,6 +1080,7 @@ namespace RC
             LuaMod::on_program_start();
             fire_program_start_for_cpp_mods();
             start_lua_mods();
+            MCP::Server::Get().start(settings_manager.MCP);
         });
 
         if (settings_manager.General.EnableDebugKeyBindings)

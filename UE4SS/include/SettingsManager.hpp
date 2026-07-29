@@ -101,6 +101,17 @@ namespace RC
             int64_t MaxMemoryUsageDuringAssetLoading{85};
         } Memory;
 
+        struct SectionMCP
+        {
+            bool Enabled{false};
+            File::StringType PipeName{};
+            File::StringType AuthToken{};
+            bool AllowLuaEval{true};
+            int64_t MaxResultCount{200};
+            int64_t MaxSerializeDepth{3};
+            bool AuditLogEnabled{true};
+        } MCP;
+
         struct SectionHooks
         {
             bool HookProcessInternal{true};

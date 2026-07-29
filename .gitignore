@@ -39,6 +39,9 @@ Intermediates/
 # standard cmake build directory
 /build
 
+# out-of-source cmake build trees (e.g. build_cmake_Game__Shipping__Win64)
+/build_cmake_*/
+
 # Others
 *.tlog
 *.log
