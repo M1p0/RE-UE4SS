@@ -15,6 +15,7 @@
 #include <cctype>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <format>
 #include <future>
@@ -30,8 +31,12 @@
 #include <Unreal/FOutputDevice.hpp>
 #include <Unreal/Hooks.hpp>
 #include <Unreal/TypeChecker.hpp>
+#include <Unreal/UAssetRegistry.hpp>
+#include <Unreal/UAssetRegistryHelpers.hpp>
 #include <Unreal/UObject.hpp>
+#include <Unreal/UObjectArray.hpp>
 #include <Unreal/UObjectGlobals.hpp>
+#include <Unreal/UnrealVersion.hpp>
 #include <Unreal/CoreUObject/UObject/Class.hpp>
 #include <Unreal/CoreUObject/UObject/UnrealType.hpp>
 #include <glaze/glaze.hpp>
@@ -236,15 +241,184 @@ namespace RC::MCP
             return obj_as_struct ? obj_as_struct->FindProperty(Unreal::FName(ensure_str(property_name), Unreal::FNAME_Find)) : nullptr;
         }
 
-        auto find_player_controller() -> Unreal::UObject*
+        auto find_function_by_path(std::string_view function_path) -> Unreal::UFunction*
         {
-            std::vector<Unreal::UObject*> player_controllers{};
-            Unreal::UObjectGlobals::FindAllOf(STR("PlayerController"), player_controllers);
-            if (player_controllers.empty())
+            if (function_path.empty())
             {
                 return nullptr;
             }
-            return player_controllers.back();
+
+            if (auto* exact_object = Unreal::UObjectGlobals::StaticFindObject_InternalSlow(
+                        nullptr,
+                        nullptr,
+                        ensure_str(function_path).c_str());
+                object_is_valid(exact_object))
+            {
+                if (auto* exact_function = Unreal::Cast<Unreal::UFunction>(exact_object);
+                    exact_function && to_string(exact_function->GetPathName()) == function_path)
+                {
+                    return exact_function;
+                }
+            }
+
+            auto function_name = std::string{function_path};
+            if (const auto separator = function_name.find_last_of(".:"); separator != std::string::npos)
+            {
+                function_name.erase(0, separator + 1);
+            }
+            const Unreal::FName resolved_name{ensure_str(function_name), Unreal::FNAME_Find};
+            if (resolved_name.IsNone())
+            {
+                return nullptr;
+            }
+
+            const auto object_count = static_cast<int64_t>(Unreal::UObjectArray::GetNumElements());
+            for (int64_t index = object_count - 1; index >= 0; --index)
+            {
+                auto* item = Unreal::FUObjectArray::IndexToObject(static_cast<int32_t>(index));
+                auto* candidate = item ? item->GetUObject() : nullptr;
+                if (!object_is_valid(candidate) ||
+                    !candidate->GetNamePrivate().Equals(resolved_name))
+                {
+                    continue;
+                }
+                if (auto* function = Unreal::Cast<Unreal::UFunction>(candidate);
+                    function && to_string(function->GetPathName()) == function_path)
+                {
+                    return function;
+                }
+            }
+            return nullptr;
+        }
+
+        auto find_function_without_interfaces(Unreal::UObject* object, const Unreal::FName& function_name) -> Unreal::UFunction*
+        {
+            if (!object || !object->GetClassPrivate())
+            {
+                return nullptr;
+            }
+
+            // Walk the class and super chain first. Interface traversal is not
+            // required for ordinary reflected member functions and can be
+            // expensive or unavailable in customized engine builds.
+            for (auto* function : Unreal::TFieldRange<Unreal::UFunction>(
+                         object->GetClassPrivate(),
+                         Unreal::EFieldIterationFlags::IncludeSuper))
+            {
+                if (function && function->GetNamePrivate().Equals(function_name))
+                {
+                    return function;
+                }
+            }
+
+            // Some customized builds expose incomplete UField chains. Try each
+            // exact owner path before falling back to an object-array scan.
+            const auto function_name_text = to_string(function_name.ToString());
+            for (Unreal::UStruct* owner = object->GetClassPrivate();
+                 owner;
+                 owner = owner->GetSuperStruct())
+            {
+                auto function_path = to_string(owner->GetPathName());
+                function_path += ':';
+                function_path += function_name_text;
+                auto* candidate = Unreal::UObjectGlobals::StaticFindObject_InternalSlow(
+                        nullptr,
+                        nullptr,
+                        ensure_str(function_path).c_str());
+                if (auto* function = Unreal::Cast<Unreal::UFunction>(candidate))
+                {
+                    Output::send(STR("[MCP] Resolved function by owner path: {}\n"),
+                                 function->GetFullName());
+                    return function;
+                }
+            }
+
+            // StaticFindObject may miss functions in customized reflection
+            // layouts. The final fallback scans by exact name and owner.
+            const auto object_count = static_cast<int64_t>(Unreal::UObjectArray::GetNumElements());
+            const auto matches_owner = [&](Unreal::UFunction* function) {
+                for (Unreal::UStruct* owner = object->GetClassPrivate();
+                     owner;
+                     owner = owner->GetSuperStruct())
+                {
+                    if (function->GetOuterPrivate() == owner)
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            for (int64_t index = object_count - 1; index >= 0; --index)
+            {
+                auto* item = Unreal::FUObjectArray::IndexToObject(static_cast<int32_t>(index));
+                auto* candidate = item ? item->GetUObject() : nullptr;
+                if (!object_is_valid(candidate) ||
+                    !candidate->GetNamePrivate().Equals(function_name))
+                {
+                    continue;
+                }
+                if (auto* function = Unreal::Cast<Unreal::UFunction>(candidate);
+                    function && matches_owner(function))
+                {
+                    Output::send(STR("[MCP] Resolved function in object-array fallback: {}\n"),
+                                 function->GetFullName());
+                    return function;
+                }
+            }
+            return nullptr;
+        }
+
+        auto find_player_controller() -> Unreal::UObject*
+        {
+            const Unreal::FName player_controller_name{STR("PlayerController"), Unreal::FNAME_Find};
+            if (player_controller_name.IsNone())
+            {
+                Output::send<LogLevel::Warning>(STR("[MCP] PlayerController FName is unavailable.\n"));
+                return nullptr;
+            }
+
+            const auto object_count = Unreal::UObjectArray::GetNumElements();
+            for (int64_t object_index = static_cast<int64_t>(object_count) - 1; object_index >= 0; --object_index)
+            {
+                auto* object_item = Unreal::FUObjectArray::IndexToObject(static_cast<int32_t>(object_index));
+                auto* candidate = object_item ? object_item->GetUObject() : nullptr;
+                if (!object_is_valid(candidate) ||
+                    candidate->HasAnyFlags(Unreal::EObjectFlags::RF_ClassDefaultObject))
+                {
+                    continue;
+                }
+
+                bool is_player_controller{};
+                for (Unreal::UStruct* candidate_class = candidate->GetClassPrivate();
+                     candidate_class;
+                     candidate_class = candidate_class->GetSuperStruct())
+                {
+                    const auto& candidate_class_name = candidate_class->GetNamePrivate();
+                    if (candidate_class_name.Equals(player_controller_name))
+                    {
+                        is_player_controller = true;
+                        break;
+                    }
+                }
+                if (!is_player_controller)
+                {
+                    continue;
+                }
+
+                const auto full_name = to_string(candidate->GetFullName());
+                if (full_name.contains("Default__") ||
+                    full_name.contains("SKEL_") ||
+                    full_name.contains("REINST_"))
+                {
+                    continue;
+                }
+
+                Output::send(STR("[MCP] Selected console context: {}\n"), candidate->GetFullName());
+                return candidate;
+            }
+            Output::send<LogLevel::Warning>(STR("[MCP] No live non-CDO PlayerController found in {} objects.\n"),
+                                            object_count);
+            return nullptr;
         }
 
         auto find_lua_mod(std::string_view mod_name) -> LuaMod*
@@ -644,8 +818,11 @@ namespace RC::MCP
         if (method == "object.inspect") return handle_inspect_object(params_json);
         if (method == "property.get") return handle_get_property(params_json);
         if (method == "property.set") return handle_set_property(params_json);
+        if (method == "delegate.invoke") return handle_invoke_delegate(params_json);
+        if (method == "asset.load") return handle_load_asset(params_json);
         if (method == "console.exec") return handle_exec_console(params_json);
         if (method == "function.call") return handle_call_function(params_json);
+        if (method == "function.inspect") return handle_inspect_function(params_json);
         if (method == "mod.reload") return handle_reload_mod(params_json);
         if (method == "function.watch") return handle_watch_function(params_json);
         if (method == "watch.remove") return handle_unwatch(params_json);
@@ -688,34 +865,47 @@ namespace RC::MCP
         const auto query = to_lower_ascii(get_string(params, "query"));
         const auto class_name = to_lower_ascii(get_string(params, "className"));
         const auto limit = std::min(get_size(params, "limit", m_config.max_result_count), m_config.max_result_count);
+        constexpr size_t scan_budget = 512;
+        const auto total_objects = Unreal::UObjectArray::GetNumElements();
+        const auto default_cursor = total_objects > 0 ? static_cast<size_t>(total_objects - 1) : 0;
+        const auto requested_cursor = get_size(params, "cursor", default_cursor);
+        int64_t object_index = total_objects > 0
+                                       ? static_cast<int64_t>(std::min(requested_cursor, default_cursor))
+                                       : -1;
 
         std::string out{"{\"objects\":["};
         size_t count{};
+        size_t scanned{};
         bool truncated{};
 
-        Unreal::UObjectGlobals::ForEachUObject([&](Unreal::UObject* object, ...) -> LoopAction {
+        for (; object_index >= 0 && scanned < scan_budget; --object_index)
+        {
+            ++scanned;
+            auto* object_item = Unreal::FUObjectArray::IndexToObject(static_cast<int32_t>(object_index));
+            auto* object = object_item ? object_item->GetUObject() : nullptr;
             if (!object_is_valid(object))
             {
-                return LoopAction::Continue;
+                continue;
+            }
+
+            const auto object_class_name = object->GetClassPrivate() ? to_string(object->GetClassPrivate()->GetName()) : "";
+            const auto object_class_lower = to_lower_ascii(object_class_name);
+            if (!class_name.empty() && !object_class_lower.contains(class_name))
+            {
+                continue;
             }
 
             const auto full_name = to_string(object->GetFullName());
             const auto full_name_lower = to_lower_ascii(full_name);
-            const auto object_class_name = object->GetClassPrivate() ? to_string(object->GetClassPrivate()->GetName()) : "";
-            const auto object_class_lower = to_lower_ascii(object_class_name);
-
             if (!query.empty() && !full_name_lower.contains(query))
             {
-                return LoopAction::Continue;
-            }
-            if (!class_name.empty() && !object_class_lower.contains(class_name))
-            {
-                return LoopAction::Continue;
+                continue;
             }
             if (count >= limit)
             {
                 truncated = true;
-                return LoopAction::Break;
+                --object_index;
+                break;
             }
 
             if (count > 0)
@@ -731,11 +921,18 @@ namespace RC::MCP
                                json_string(object_class_name),
                                json_string(std::format("{:016X}", std::bit_cast<uintptr_t>(object))));
             ++count;
+        }
 
-            return LoopAction::Continue;
-        });
-
-        out += std::format("],\"count\":{},\"truncated\":{}}}", count, bool_json(truncated));
+        if (object_index >= 0)
+        {
+            truncated = true;
+        }
+        out += std::format(
+                "],\"count\":{},\"scanned\":{},\"truncated\":{},\"nextCursor\":{}}}",
+                count,
+                scanned,
+                bool_json(truncated),
+                object_index >= 0 ? std::to_string(object_index) : "null");
         return out;
     }
 
@@ -829,6 +1026,125 @@ namespace RC::MCP
         return std::format("{{\"set\":true,\"name\":{},\"value\":{}}}", json_string(to_string(property->GetName())), json_string(property_to_text(object, property)));
     }
 
+    auto Server::handle_invoke_delegate(std::string_view params_json) -> std::string
+    {
+        const auto params = parse_object(params_json);
+        auto* object = resolve_object(get_string(params, "handle"));
+        if (!object_is_valid(object))
+        {
+            throw std::runtime_error{"object_invalid"};
+        }
+
+        const auto property_name = get_string(params, "propertyName");
+        auto* property = find_property(object, property_name);
+        if (!property)
+        {
+            throw std::runtime_error{"property_not_found"};
+        }
+
+        size_t invoked_count{};
+        const auto invoke_one = [&](const Unreal::FScriptDelegate& delegate) {
+            if (!delegate.IsBound())
+            {
+                return;
+            }
+            auto* target = delegate.GetUObject();
+            if (!object_is_valid(target))
+            {
+                return;
+            }
+            auto* function = find_function_without_interfaces(target, delegate.GetFunctionName());
+            if (!function)
+            {
+                return;
+            }
+            const size_t parameter_size = function->GetParmsSize();
+            if (parameter_size > 1024 * 1024)
+            {
+                throw std::runtime_error{"invalid_parameter_size"};
+            }
+            std::vector<std::byte> parameter_data(std::max<size_t>(parameter_size, 1));
+            target->ProcessEvent(function, parameter_data.data());
+            ++invoked_count;
+        };
+
+        if (auto* delegate_property = Unreal::CastField<Unreal::FDelegateProperty>(property))
+        {
+            auto* delegate = delegate_property->ContainerPtrToValuePtr<Unreal::FScriptDelegate>(object);
+            if (delegate)
+            {
+                invoke_one(*delegate);
+            }
+        }
+        else if (auto* multicast_property = Unreal::CastField<Unreal::FMulticastDelegateProperty>(property))
+        {
+            auto* property_value = multicast_property->ContainerPtrToValuePtr<void>(object);
+            const auto* delegate = multicast_property->GetMulticastDelegate(property_value);
+            if (delegate)
+            {
+                for (const auto& invocation : delegate->InvocationList)
+                {
+                    invoke_one(invocation);
+                }
+            }
+        }
+        else
+        {
+            throw std::runtime_error{"property_not_delegate"};
+        }
+
+        return std::format(
+                "{{\"invoked\":{},\"invokedCount\":{},\"context\":{},\"propertyName\":{}}}",
+                bool_json(invoked_count > 0),
+                invoked_count,
+                json_string(to_string(object->GetFullName())),
+                json_string(property_name));
+    }
+
+    auto Server::handle_load_asset(std::string_view params_json) -> std::string
+    {
+        const auto params = parse_object(params_json);
+        const auto asset_path = get_string(params, "assetPath");
+        if (asset_path.empty())
+        {
+            throw std::runtime_error{"missing_assetPath"};
+        }
+
+        auto* asset_registry = static_cast<Unreal::UAssetRegistry*>(
+                Unreal::UAssetRegistryHelpers::GetAssetRegistry().ObjectPointer);
+        if (!asset_registry)
+        {
+            throw std::runtime_error{"asset_registry_unavailable"};
+        }
+
+        auto asset_name = Unreal::FName(ensure_str(asset_path), Unreal::FNAME_Add);
+        auto asset_data = asset_registry->GetAssetByObjectPath(asset_name);
+        const bool was_found =
+                (Unreal::Version::IsAtMost(5, 0) && asset_data.ObjectPath().GetComparisonIndex()) ||
+                asset_data.PackageName().GetComparisonIndex();
+
+        Unreal::UObject* loaded_asset{};
+        if (was_found)
+        {
+            loaded_asset = Unreal::UAssetRegistryHelpers::GetAsset(asset_data);
+        }
+
+        if (!object_is_valid(loaded_asset))
+        {
+            return std::format("{{\"found\":{},\"loaded\":false,\"assetPath\":{}}}",
+                               bool_json(was_found),
+                               json_string(asset_path));
+        }
+
+        const auto full_name = to_string(loaded_asset->GetFullName());
+        return std::format(
+                "{{\"found\":true,\"loaded\":true,\"assetPath\":{},\"handle\":{},\"fullName\":{},\"path\":{}}}",
+                json_string(asset_path),
+                json_string(remember_object(full_name)),
+                json_string(full_name),
+                json_string(to_string(loaded_asset->GetPathName())));
+    }
+
     auto Server::handle_exec_console(std::string_view params_json) -> std::string
     {
         const auto params = parse_object(params_json);
@@ -844,17 +1160,46 @@ namespace RC::MCP
 
         const auto command = ensure_str(get_string(params, "command"));
         Unreal::FOutputDevice output_device{};
-        const auto succeeded = object->ProcessConsoleExec(FromCharTypePtr<TCHAR>(command.c_str()), output_device, object);
-        return std::format("{{\"succeeded\":{},\"context\":{},\"command\":{}}}",
+        auto succeeded = object->ProcessConsoleExec(FromCharTypePtr<TCHAR>(command.c_str()), output_device, object);
+        bool used_console_command_wrapper{};
+        if (!succeeded)
+        {
+            const Unreal::FName console_command_name{STR("ConsoleCommand"), Unreal::FNAME_Find};
+            if (!console_command_name.IsNone())
+            {
+                if (auto* console_command_function =
+                            find_function_without_interfaces(object, console_command_name))
+                {
+                    auto wrapped_command = ensure_str(std::string{"ConsoleCommand \""});
+                    wrapped_command.append(command);
+                    wrapped_command.append(STR("\""));
+                    auto& function_flags = console_command_function->GetFunctionFlags();
+                    const auto original_flags = function_flags;
+                    function_flags |= Unreal::FUNC_Exec;
+                    succeeded = object->ProcessConsoleExec(
+                            FromCharTypePtr<TCHAR>(wrapped_command.c_str()),
+                            output_device,
+                            object);
+                    function_flags = original_flags;
+                    used_console_command_wrapper = succeeded;
+                }
+            }
+        }
+        return std::format("{{\"succeeded\":{},\"context\":{},\"command\":{},\"dispatch\":{}}}",
                            bool_json(succeeded),
                            json_string(to_string(object->GetFullName())),
-                           json_string(to_string(command)));
+                           json_string(to_string(command)),
+                           json_string(used_console_command_wrapper ? "PlayerController.ConsoleCommand" : "ProcessConsoleExec"));
     }
 
     auto Server::handle_call_function(std::string_view params_json) -> std::string
     {
         const auto params = parse_object(params_json);
         auto* object = resolve_object(get_string(params, "handle"));
+        if (!object)
+        {
+            object = find_player_controller();
+        }
         if (!object_is_valid(object))
         {
             throw std::runtime_error{"object_invalid"};
@@ -866,22 +1211,98 @@ namespace RC::MCP
             throw std::runtime_error{"missing_functionName"};
         }
 
-        Unreal::UFunction* function{};
-        for (auto* candidate : Unreal::TFieldRange<Unreal::UFunction>(object->GetClassPrivate(), Unreal::EFieldIterationFlags::IncludeAll))
+        const Unreal::FName resolved_function_name{ensure_str(function_name), Unreal::FNAME_Find};
+        if (resolved_function_name.IsNone())
         {
-            if (candidate && to_string(candidate->GetName()) == function_name)
-            {
-                function = candidate;
-                break;
-            }
+            throw std::runtime_error{"function_name_not_found"};
         }
+        const auto function_path = get_string(params, "functionPath");
+        Unreal::UFunction* function = function_path.empty()
+                ? find_function_without_interfaces(object, resolved_function_name)
+                : find_function_by_path(function_path);
         if (!function)
         {
             throw std::runtime_error{"function_not_found"};
         }
 
+        const auto arguments = get_array_strings(params, "args");
+        if (arguments.empty())
+        {
+            const size_t parameter_size = function->GetParmsSize();
+            if (parameter_size > 1024 * 1024)
+            {
+                throw std::runtime_error{"invalid_parameter_size"};
+            }
+
+            std::vector<std::byte> parameter_data(std::max<size_t>(parameter_size, 1));
+            const auto parameter_hex = get_string(params, "paramHex");
+            if (!parameter_hex.empty())
+            {
+                if ((parameter_hex.size() % 2) != 0 || parameter_hex.size() / 2 > parameter_size)
+                {
+                    throw std::runtime_error{"invalid_param_hex_size"};
+                }
+                const auto hex_value = [](char c) -> uint8_t {
+                    if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
+                    if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(c - 'a' + 10);
+                    if (c >= 'A' && c <= 'F') return static_cast<uint8_t>(c - 'A' + 10);
+                    throw std::runtime_error{"invalid_param_hex_character"};
+                };
+                for (size_t index = 0; index < parameter_hex.size(); index += 2)
+                {
+                    parameter_data[index / 2] = static_cast<std::byte>(
+                            (hex_value(parameter_hex[index]) << 4) |
+                            hex_value(parameter_hex[index + 1]));
+                }
+            }
+            const auto object_argument_handle = get_string(params, "objectArgHandle");
+            const auto object_argument_offset = get_size(params, "objectArgOffset", 0);
+            Unreal::UObject* object_argument{};
+            if (!object_argument_handle.empty())
+            {
+                object_argument = resolve_object(object_argument_handle);
+                if (!object_is_valid(object_argument))
+                {
+                    throw std::runtime_error{"object_argument_invalid"};
+                }
+                if (object_argument_offset > parameter_size ||
+                    parameter_size - object_argument_offset < sizeof(object_argument))
+                {
+                    throw std::runtime_error{"object_argument_out_of_bounds"};
+                }
+                std::memcpy(
+                        parameter_data.data() + object_argument_offset,
+                        &object_argument,
+                        sizeof(object_argument));
+            }
+            Output::send(STR("[MCP] Direct ProcessEvent call: {} on {} (0x{:X} parameter bytes).\n"),
+                         ensure_str(function_name),
+                         object->GetFullName(),
+                         parameter_size);
+            object->ProcessEvent(function, parameter_data.data());
+            constexpr char HEX_DIGITS[]{"0123456789ABCDEF"};
+            std::string result_hex{};
+            result_hex.reserve(parameter_size * 2);
+            for (size_t index = 0; index < parameter_size; ++index)
+            {
+                const auto value = std::to_integer<uint8_t>(parameter_data[index]);
+                result_hex.push_back(HEX_DIGITS[value >> 4]);
+                result_hex.push_back(HEX_DIGITS[value & 0x0F]);
+            }
+            return std::format(
+                    "{{\"succeeded\":true,\"dispatch\":\"ProcessEvent\",\"context\":{},\"functionName\":{},"
+                    "\"parameterSize\":{},\"paramHex\":{},\"resultHex\":{},\"objectArg\":{},\"objectArgOffset\":{}}}",
+                    json_string(to_string(object->GetFullName())),
+                    json_string(function_name),
+                    parameter_size,
+                    parameter_hex.empty() ? "null" : json_string(parameter_hex),
+                    json_string(result_hex),
+                    object_argument ? json_string(to_string(object_argument->GetFullName())) : "null",
+                    object_argument_offset);
+        }
+
         auto command = ensure_str(function_name);
-        for (const auto& arg : get_array_strings(params, "args"))
+        for (const auto& arg : arguments)
         {
             command.append(STR(" "));
             command.append(ensure_str(arg));
@@ -900,6 +1321,74 @@ namespace RC::MCP
                            json_string(to_string(object->GetFullName())),
                            json_string(function_name),
                            json_string(to_string(command)));
+    }
+
+    auto Server::handle_inspect_function(std::string_view params_json) -> std::string
+    {
+        const auto params = parse_object(params_json);
+        const auto function_name = get_string(params, "functionName");
+        if (function_name.empty())
+        {
+            throw std::runtime_error{"missing_functionName"};
+        }
+
+        const Unreal::FName resolved_function_name{ensure_str(function_name), Unreal::FNAME_Find};
+        if (resolved_function_name.IsNone())
+        {
+            throw std::runtime_error{"function_name_not_found"};
+        }
+
+        auto* object = resolve_object(get_string(params, "handle"));
+        if (!object)
+        {
+            object = find_player_controller();
+        }
+        if (!object_is_valid(object))
+        {
+            throw std::runtime_error{"object_invalid"};
+        }
+
+        auto* function = find_function_without_interfaces(object, resolved_function_name);
+        if (!function)
+        {
+            throw std::runtime_error{"function_not_found"};
+        }
+
+        std::string out{"{\"functions\":["};
+        out += std::format("{{\"fullName\":{},\"path\":{},\"parameterSize\":{},\"functionFlags\":{},\"parameters\":[",
+                           json_string(to_string(function->GetFullName())),
+                           json_string(to_string(function->GetPathName())),
+                           function->GetParmsSize(),
+                           static_cast<uint64_t>(function->GetFunctionFlags()));
+
+        size_t parameter_count{};
+        for (auto* property : Unreal::TFieldRange<Unreal::FProperty>(
+                     function,
+                     Unreal::EFieldIterationFlags::IncludeDeprecated))
+        {
+            if (!property || !property->HasAnyPropertyFlags(Unreal::CPF_Parm))
+            {
+                continue;
+            }
+            if (parameter_count > 0)
+            {
+                out += ',';
+            }
+            const auto cpp_type = property->GetCPPType();
+            out += std::format(
+                    "{{\"name\":{},\"fullName\":{},\"cppType\":{},\"offset\":{},\"size\":{},\"propertyFlags\":{}}}",
+                    json_string(to_string(property->GetName())),
+                    json_string(to_string(property->GetFullName())),
+                    json_string(to_string(*cpp_type)),
+                    property->GetOffset_Internal(),
+                    property->GetSize(),
+                    static_cast<uint64_t>(property->GetPropertyFlags()));
+            ++parameter_count;
+        }
+        out += std::format("],\"parameterCount\":{}}}],\"count\":1,\"context\":{}}}",
+                           parameter_count,
+                           json_string(to_string(object->GetFullName())));
+        return out;
     }
 
     auto Server::handle_reload_mod(std::string_view params_json) -> std::string
@@ -1052,16 +1541,52 @@ namespace RC::MCP
             }
         }
 
-        Unreal::UObject* found{};
-        Unreal::UObjectGlobals::ForEachUObject([&](Unreal::UObject* object, ...) -> LoopAction {
-            if (object_is_valid(object) && to_string(object->GetFullName()) == full_name)
-            {
-                found = object;
-                return LoopAction::Break;
-            }
-            return LoopAction::Continue;
-        });
+        // Handles store GetFullName() ("ClassName /Path/Object"). Unreal's
+        // exact lookup accepts the path portion and avoids a global scan.
+        auto object_path = full_name;
+        if (const auto separator = object_path.find(' '); separator != std::string::npos)
+        {
+            object_path.erase(0, separator + 1);
+        }
+        auto* object = Unreal::UObjectGlobals::StaticFindObject_InternalSlow(
+                nullptr,
+                nullptr,
+                ensure_str(object_path).c_str());
+        if (object_is_valid(object) &&
+            to_string(object->GetPathName()) == object_path)
+        {
+            return object;
+        }
 
-        return found;
+        // Deep actor-component paths are not accepted by every engine build's
+        // slow object parser. Narrow candidates by exact short name, then
+        // compare their full paths.
+        auto short_name = object_path;
+        if (const auto separator = short_name.find_last_of(".:"); separator != std::string::npos)
+        {
+            short_name.erase(0, separator + 1);
+        }
+        const Unreal::FName resolved_short_name{ensure_str(short_name), Unreal::FNAME_Find};
+        if (resolved_short_name.IsNone())
+        {
+            return nullptr;
+        }
+
+        const auto object_count = static_cast<int64_t>(Unreal::UObjectArray::GetNumElements());
+        for (int64_t index = object_count - 1; index >= 0; --index)
+        {
+            auto* item = Unreal::FUObjectArray::IndexToObject(static_cast<int32_t>(index));
+            auto* candidate = item ? item->GetUObject() : nullptr;
+            if (!object_is_valid(candidate) ||
+                !candidate->GetNamePrivate().Equals(resolved_short_name))
+            {
+                continue;
+            }
+            if (to_string(candidate->GetPathName()) == object_path)
+            {
+                return candidate;
+            }
+        }
+        return nullptr;
     }
 } // namespace RC::MCP

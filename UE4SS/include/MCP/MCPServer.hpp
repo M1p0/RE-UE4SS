@@ -69,8 +69,11 @@ namespace RC::MCP
         auto handle_inspect_object(std::string_view params_json) -> std::string;
         auto handle_get_property(std::string_view params_json) -> std::string;
         auto handle_set_property(std::string_view params_json) -> std::string;
+        auto handle_invoke_delegate(std::string_view params_json) -> std::string;
+        auto handle_load_asset(std::string_view params_json) -> std::string;
         auto handle_exec_console(std::string_view params_json) -> std::string;
         auto handle_call_function(std::string_view params_json) -> std::string;
+        auto handle_inspect_function(std::string_view params_json) -> std::string;
         auto handle_reload_mod(std::string_view params_json) -> std::string;
         auto handle_watch_function(std::string_view params_json) -> std::string;
         auto handle_unwatch(std::string_view params_json) -> std::string;

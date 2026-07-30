@@ -165,6 +165,7 @@ function registerTools(server: McpServer, bridge: UE4SSBridgeClient) {
         query: z.string().default(""),
         className: z.string().optional(),
         limit: z.number().int().positive().optional(),
+        cursor: z.number().int().nonnegative().optional(),
       },
     },
     async (args) => asText(await bridge.call("objects.search", args)),
@@ -211,6 +212,31 @@ function registerTools(server: McpServer, bridge: UE4SSBridgeClient) {
   );
 
   server.registerTool(
+    "ue4ss.invoke_delegate",
+    {
+      title: "Invoke UObject Delegate",
+      description: "Invoke a zero-parameter reflected single-cast or multicast delegate property on a live UObject.",
+      inputSchema: {
+        handle: z.string().min(1),
+        propertyName: z.string().min(1),
+      },
+    },
+    async (args) => asText(await bridge.call("delegate.invoke", args)),
+  );
+
+  server.registerTool(
+    "ue4ss.load_asset",
+    {
+      title: "Load Unreal Asset",
+      description: "Load one exact Unreal asset through the in-process AssetRegistry on the game thread.",
+      inputSchema: {
+        assetPath: z.string().min(1),
+      },
+    },
+    async (args) => asText(await bridge.call("asset.load", args)),
+  );
+
+  server.registerTool(
     "ue4ss.call_function",
     {
       title: "Call Function",
@@ -218,10 +244,27 @@ function registerTools(server: McpServer, bridge: UE4SSBridgeClient) {
       inputSchema: {
         handle: z.string(),
         functionName: z.string(),
+        functionPath: z.string().optional(),
+        paramHex: z.string().regex(/^(?:[0-9A-Fa-f]{2})*$/).optional(),
+        objectArgHandle: z.string().optional(),
+        objectArgOffset: z.number().int().nonnegative().optional(),
         args: z.array(z.string()).default([]),
       },
     },
     async (args) => asText(await bridge.call("function.call", args)),
+  );
+
+  server.registerTool(
+    "ue4ss.inspect_function",
+    {
+      title: "Inspect UFunction",
+      description: "Inspect one reflected UFunction on a specific UObject and its class/super chain, including parameter types, offsets, sizes, and flags.",
+      inputSchema: {
+        functionName: z.string().min(1),
+        handle: z.string().optional(),
+      },
+    },
+    async (args) => asText(await bridge.call("function.inspect", args)),
   );
 
   server.registerTool(
