@@ -179,6 +179,9 @@ function registerTools(server: McpServer, bridge: UE4SSBridgeClient) {
       inputSchema: {
         handle: z.string().optional(),
         fullName: z.string().optional(),
+        includeValues: z.boolean().optional(),
+        propertyQuery: z.string().optional(),
+        limit: z.number().int().positive().optional(),
       },
     },
     async (args) => asText(await bridge.call("object.inspect", args)),
@@ -244,6 +247,7 @@ function registerTools(server: McpServer, bridge: UE4SSBridgeClient) {
       inputSchema: {
         handle: z.string(),
         functionName: z.string(),
+        functionHandle: z.string().optional(),
         functionPath: z.string().optional(),
         paramHex: z.string().regex(/^(?:[0-9A-Fa-f]{2})*$/).optional(),
         objectArgHandle: z.string().optional(),
@@ -262,6 +266,7 @@ function registerTools(server: McpServer, bridge: UE4SSBridgeClient) {
       inputSchema: {
         functionName: z.string().min(1),
         handle: z.string().optional(),
+        functionHandle: z.string().optional(),
       },
     },
     async (args) => asText(await bridge.call("function.inspect", args)),

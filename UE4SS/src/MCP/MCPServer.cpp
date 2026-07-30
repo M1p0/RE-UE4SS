@@ -957,25 +957,46 @@ namespace RC::MCP
                                       json_string(object->GetClassPrivate() ? to_string(object->GetClassPrivate()->GetName()) : ""),
                                       json_string(std::format("{:016X}", std::bit_cast<uintptr_t>(object))));
 
+        const auto include_values = get_bool(params, "includeValues", true);
+        const auto property_query = to_lower_ascii(get_string(params, "propertyQuery"));
+        const auto property_limit = std::min(get_size(params, "limit", m_config.max_result_count), m_config.max_result_count);
         size_t count{};
         for (auto* property : Unreal::TFieldRange<Unreal::FProperty>(object->GetClassPrivate(), Unreal::EFieldIterationFlags::IncludeDeprecated))
         {
-            if (!property || count >= m_config.max_result_count)
+            if (!property || count >= property_limit)
             {
                 break;
+            }
+            const auto property_name = to_string(property->GetName());
+            const auto property_full_name = to_string(property->GetFullName());
+            if (!property_query.empty() &&
+                !to_lower_ascii(property_name).contains(property_query) &&
+                !to_lower_ascii(property_full_name).contains(property_query))
+            {
+                continue;
             }
             if (count > 0)
             {
                 out += ',';
             }
-            out += std::format("{{\"name\":{},\"fullName\":{},\"value\":{}}}",
-                               json_string(to_string(property->GetName())),
-                               json_string(to_string(property->GetFullName())),
-                               json_string(property_to_text(object, property)));
+            const auto cpp_type = property->GetCPPType();
+            out += std::format(
+                    "{{\"name\":{},\"fullName\":{},\"cppType\":{},\"offset\":{},\"size\":{},\"propertyFlags\":{}",
+                    json_string(property_name),
+                    json_string(property_full_name),
+                    json_string(to_string(*cpp_type)),
+                    property->GetOffset_Internal(),
+                    property->GetSize(),
+                    static_cast<uint64_t>(property->GetPropertyFlags()));
+            if (include_values)
+            {
+                out += std::format(",\"value\":{}", json_string(property_to_text(object, property)));
+            }
+            out += '}';
             ++count;
         }
 
-        out += std::format("],\"propertyCount\":{}}}", count);
+        out += std::format("],\"propertyCount\":{},\"includeValues\":{}}}", count, bool_json(include_values));
         return out;
     }
 
@@ -1216,10 +1237,27 @@ namespace RC::MCP
         {
             throw std::runtime_error{"function_name_not_found"};
         }
+        const auto function_handle = get_string(params, "functionHandle");
         const auto function_path = get_string(params, "functionPath");
-        Unreal::UFunction* function = function_path.empty()
-                ? find_function_without_interfaces(object, resolved_function_name)
-                : find_function_by_path(function_path);
+        Unreal::UFunction* function{};
+        if (!function_handle.empty())
+        {
+            function = Unreal::Cast<Unreal::UFunction>(resolve_object(function_handle));
+            if (function && !function->GetNamePrivate().Equals(resolved_function_name))
+            {
+                throw std::runtime_error{"function_handle_name_mismatch"};
+            }
+            if (function && find_function_without_interfaces(object, resolved_function_name) != function)
+            {
+                throw std::runtime_error{"function_handle_context_mismatch"};
+            }
+        }
+        else
+        {
+            function = function_path.empty()
+                    ? find_function_without_interfaces(object, resolved_function_name)
+                    : find_function_by_path(function_path);
+        }
         if (!function)
         {
             throw std::runtime_error{"function_not_found"};
@@ -1339,19 +1377,31 @@ namespace RC::MCP
         }
 
         auto* object = resolve_object(get_string(params, "handle"));
-        if (!object)
+        const auto function_handle = get_string(params, "functionHandle");
+        auto* function = Unreal::Cast<Unreal::UFunction>(resolve_object(function_handle));
+        if (!function_handle.empty() && !function)
         {
-            object = find_player_controller();
+            throw std::runtime_error{"function_handle_invalid"};
         }
-        if (!object_is_valid(object))
+        if (function && !function->GetNamePrivate().Equals(resolved_function_name))
         {
-            throw std::runtime_error{"object_invalid"};
+            throw std::runtime_error{"function_handle_name_mismatch"};
         }
-
-        auto* function = find_function_without_interfaces(object, resolved_function_name);
         if (!function)
         {
-            throw std::runtime_error{"function_not_found"};
+            if (!object)
+            {
+                object = find_player_controller();
+            }
+            if (!object_is_valid(object))
+            {
+                throw std::runtime_error{"object_invalid"};
+            }
+            function = find_function_without_interfaces(object, resolved_function_name);
+            if (!function)
+            {
+                throw std::runtime_error{"function_not_found"};
+            }
         }
 
         std::string out{"{\"functions\":["};
@@ -1385,9 +1435,10 @@ namespace RC::MCP
                     static_cast<uint64_t>(property->GetPropertyFlags()));
             ++parameter_count;
         }
-        out += std::format("],\"parameterCount\":{}}}],\"count\":1,\"context\":{}}}",
+        out += std::format("],\"parameterCount\":{}}}],\"count\":1,\"context\":{},\"resolution\":{}}}",
                            parameter_count,
-                           json_string(to_string(object->GetFullName())));
+                           object ? json_string(to_string(object->GetFullName())) : "null",
+                           json_string(object ? "contextObject" : "functionHandle"));
         return out;
     }
 
