@@ -961,42 +961,57 @@ namespace RC::MCP
         const auto property_query = to_lower_ascii(get_string(params, "propertyQuery"));
         const auto property_limit = std::min(get_size(params, "limit", m_config.max_result_count), m_config.max_result_count);
         size_t count{};
-        for (auto* property : Unreal::TFieldRange<Unreal::FProperty>(object->GetClassPrivate(), Unreal::EFieldIterationFlags::IncludeDeprecated))
+        size_t visited{};
+        constexpr size_t max_fields_visited = 4096;
+        for (Unreal::UStruct* owner = object->GetClassPrivate();
+             owner && count < property_limit && visited < max_fields_visited;
+             owner = owner->GetSuperStruct())
         {
-            if (!property || count >= property_limit)
+            auto* field = owner->GetChildProperties();
+            while (field && count < property_limit && visited++ < max_fields_visited)
             {
-                break;
+                auto* property = static_cast<Unreal::FProperty*>(field);
+                const auto property_name = to_string(property->GetName());
+                const auto property_full_name = to_string(property->GetFullName());
+                if (property_query.empty() ||
+                    to_lower_ascii(property_name).contains(property_query) ||
+                    to_lower_ascii(property_full_name).contains(property_query))
+                {
+                    if (count > 0)
+                    {
+                        out += ',';
+                    }
+                    const auto cpp_type = property->GetCPPType();
+                    out += std::format(
+                            "{{\"name\":{},\"fullName\":{},\"cppType\":{},\"offset\":{},\"size\":{},\"propertyFlags\":{},\"owner\":{}",
+                            json_string(property_name),
+                            json_string(property_full_name),
+                            json_string(to_string(*cpp_type)),
+                            property->GetOffset_Internal(),
+                            property->GetSize(),
+                            static_cast<uint64_t>(property->GetPropertyFlags()),
+                            json_string(to_string(owner->GetFullName())));
+                    if (include_values)
+                    {
+                        out += std::format(",\"value\":{}", json_string(property_to_text(object, property)));
+                    }
+                    out += '}';
+                    ++count;
+                }
+
+                auto* next = field->GetNextFieldRaw();
+                if (next == field)
+                {
+                    break;
+                }
+                field = next;
             }
-            const auto property_name = to_string(property->GetName());
-            const auto property_full_name = to_string(property->GetFullName());
-            if (!property_query.empty() &&
-                !to_lower_ascii(property_name).contains(property_query) &&
-                !to_lower_ascii(property_full_name).contains(property_query))
-            {
-                continue;
-            }
-            if (count > 0)
-            {
-                out += ',';
-            }
-            const auto cpp_type = property->GetCPPType();
-            out += std::format(
-                    "{{\"name\":{},\"fullName\":{},\"cppType\":{},\"offset\":{},\"size\":{},\"propertyFlags\":{}",
-                    json_string(property_name),
-                    json_string(property_full_name),
-                    json_string(to_string(*cpp_type)),
-                    property->GetOffset_Internal(),
-                    property->GetSize(),
-                    static_cast<uint64_t>(property->GetPropertyFlags()));
-            if (include_values)
-            {
-                out += std::format(",\"value\":{}", json_string(property_to_text(object, property)));
-            }
-            out += '}';
-            ++count;
         }
 
-        out += std::format("],\"propertyCount\":{},\"includeValues\":{}}}", count, bool_json(include_values));
+        out += std::format("],\"propertyCount\":{},\"fieldsVisited\":{},\"includeValues\":{}}}",
+                           count,
+                           visited,
+                           bool_json(include_values));
         return out;
     }
 
@@ -1412,13 +1427,10 @@ namespace RC::MCP
                            static_cast<uint64_t>(function->GetFunctionFlags()));
 
         size_t parameter_count{};
-        for (auto* property : Unreal::TFieldRange<Unreal::FProperty>(
-                     function,
-                     Unreal::EFieldIterationFlags::IncludeDeprecated))
-        {
+        const auto append_parameter = [&](Unreal::FProperty* property, std::string_view source) {
             if (!property || !property->HasAnyPropertyFlags(Unreal::CPF_Parm))
             {
-                continue;
+                return;
             }
             if (parameter_count > 0)
             {
@@ -1426,14 +1438,44 @@ namespace RC::MCP
             }
             const auto cpp_type = property->GetCPPType();
             out += std::format(
-                    "{{\"name\":{},\"fullName\":{},\"cppType\":{},\"offset\":{},\"size\":{},\"propertyFlags\":{}}}",
+                    "{{\"name\":{},\"fullName\":{},\"cppType\":{},\"offset\":{},\"size\":{},\"propertyFlags\":{},\"source\":{}}}",
                     json_string(to_string(property->GetName())),
                     json_string(to_string(property->GetFullName())),
                     json_string(to_string(*cpp_type)),
                     property->GetOffset_Internal(),
                     property->GetSize(),
-                    static_cast<uint64_t>(property->GetPropertyFlags()));
+                    static_cast<uint64_t>(property->GetPropertyFlags()),
+                    json_string(source));
             ++parameter_count;
+        };
+
+        for (auto* property : Unreal::TFieldRange<Unreal::FProperty>(
+                     function,
+                     Unreal::EFieldIterationFlags::IncludeDeprecated))
+        {
+            append_parameter(property, "TFieldRange");
+        }
+
+        // Some customized UE4 builds report a pre-4.25 version while storing
+        // parameters in the post-4.25 FField/ChildProperties chain. In that
+        // case TFieldRange<FProperty> selects Children and returns no params.
+        // Walk this single function's ChildProperties chain as a bounded
+        // fallback; this avoids a global SDK/type-generation pass.
+        if (parameter_count == 0)
+        {
+            auto* field = function->GetChildProperties();
+            size_t visited{};
+            while (field && visited++ < 128)
+            {
+                auto* property = static_cast<Unreal::FProperty*>(field);
+                append_parameter(property, "ChildProperties");
+                auto* next = field->GetNextFieldRaw();
+                if (next == field)
+                {
+                    break;
+                }
+                field = next;
+            }
         }
         out += std::format("],\"parameterCount\":{}}}],\"count\":1,\"context\":{},\"resolution\":{}}}",
                            parameter_count,

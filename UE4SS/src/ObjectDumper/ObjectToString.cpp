@@ -348,62 +348,106 @@ namespace RC::ObjectDumper
     auto init() -> void
     {
         object_to_string_functions[UEnum::StaticClass()->HashObject()] = &enum_to_string;
-        object_to_string_functions[UUserDefinedEnum::StaticClass()->HashObject()] = &enum_to_string;
+        if (UUserDefinedEnum::IsStaticClassAvailable())
+        {
+            object_to_string_functions[UUserDefinedEnum::StaticClass()->HashObject()] = &enum_to_string;
+        }
         object_to_string_functions[UClass::StaticClass()->HashObject()] = &struct_to_string;
-        object_to_string_functions[UBlueprintGeneratedClass::StaticClass()->HashObject()] = &struct_to_string;
-        object_to_string_functions[UWidgetBlueprintGeneratedClass::StaticClass()->HashObject()] = &struct_to_string;
-        object_to_string_functions[UAnimBlueprintGeneratedClass::StaticClass()->HashObject()] = &struct_to_string;
+        if (UBlueprintGeneratedClass::IsStaticClassAvailable())
+        {
+            object_to_string_functions[UBlueprintGeneratedClass::StaticClass()->HashObject()] = &struct_to_string;
+        }
+        if (UWidgetBlueprintGeneratedClass::IsStaticClassAvailable())
+        {
+            object_to_string_functions[UWidgetBlueprintGeneratedClass::StaticClass()->HashObject()] = &struct_to_string;
+        }
+        if (UAnimBlueprintGeneratedClass::IsStaticClassAvailable())
+        {
+            object_to_string_functions[UAnimBlueprintGeneratedClass::StaticClass()->HashObject()] = &struct_to_string;
+        }
         // The 'function_to_string' function is explicitly called, so it doesn't need to be in this map.
         // object_to_string_functions[UFunction::StaticClass()->HashObject()] = &function_to_string;
         // object_to_string_functions[UDelegateFunction::StaticClass()->HashObject()] = &function_to_string;
         // object_to_string_functions[USparseDelegateFunction::StaticClass()->HashObject()] = &function_to_string;
         object_to_string_functions[UScriptStruct::StaticClass()->HashObject()] = &struct_to_string;
         object_to_string_complex_functions[UScriptStruct::StaticClass()->HashObject()] = &scriptstruct_to_string_complex;
-        object_to_string_functions[FObjectProperty::StaticClass().HashObject()] = &objectproperty_to_string;
-        object_to_string_functions[FObjectPtrProperty::StaticClass().HashObject()] = &objectproperty_to_string;
-        object_to_string_functions[FAssetObjectProperty::StaticClass().HashObject()] = &objectproperty_to_string;
-        object_to_string_functions[FAssetClassProperty::StaticClass().HashObject()] = &classproperty_to_string;
-        object_to_string_functions[FInt8Property::StaticClass().HashObject()] = &property_to_string;
-        object_to_string_functions[FInt16Property::StaticClass().HashObject()] = &property_to_string;
-        object_to_string_functions[FIntProperty::StaticClass().HashObject()] = &property_to_string;
-        object_to_string_functions[FInt64Property::StaticClass().HashObject()] = &property_to_string;
-        object_to_string_functions[FByteProperty::StaticClass().HashObject()] = &property_to_string;
-        object_to_string_functions[FUInt16Property::StaticClass().HashObject()] = &property_to_string;
-        object_to_string_functions[FUInt32Property::StaticClass().HashObject()] = &property_to_string;
-        object_to_string_functions[FUInt64Property::StaticClass().HashObject()] = &property_to_string;
-        object_to_string_functions[FNameProperty::StaticClass().HashObject()] = &property_to_string;
-        object_to_string_functions[FFloatProperty::StaticClass().HashObject()] = &property_to_string;
-        object_to_string_functions[FBoolProperty::StaticClass().HashObject()] = &boolproperty_to_string;
-        object_to_string_functions[FArrayProperty::StaticClass().HashObject()] = &arrayproperty_to_string;
-        object_to_string_complex_functions[FArrayProperty::StaticClass().HashObject()] = &arrayproperty_to_string_complex;
-        object_to_string_functions[FMapProperty::StaticClass().HashObject()] = &mapproperty_to_string;
-        object_to_string_complex_functions[FMapProperty::StaticClass().HashObject()] = &mapproperty_to_string_complex;
-        object_to_string_functions[FStructProperty::StaticClass().HashObject()] = &structproperty_to_string;
-        object_to_string_functions[FClassProperty::StaticClass().HashObject()] = &classproperty_to_string;
+#define REGISTER_FIELD(Type, Function)                                                                                             \
+        do                                                                                                                        \
+        {                                                                                                                         \
+            try                                                                                                                   \
+            {                                                                                                                     \
+                auto field_class = Type::StaticClass();                                                                           \
+                if (field_class.IsValid())                                                                                        \
+                {                                                                                                                 \
+                    object_to_string_functions[field_class.HashObject()] = Function;                                               \
+                }                                                                                                                 \
+            }                                                                                                                     \
+            catch (...)                                                                                                           \
+            {                                                                                                                     \
+            }                                                                                                                     \
+        } while (false)
+#define REGISTER_COMPLEX_FIELD(Type, Function)                                                                                     \
+        do                                                                                                                        \
+        {                                                                                                                         \
+            try                                                                                                                   \
+            {                                                                                                                     \
+                auto field_class = Type::StaticClass();                                                                           \
+                if (field_class.IsValid())                                                                                        \
+                {                                                                                                                 \
+                    object_to_string_complex_functions[field_class.HashObject()] = Function;                                       \
+                }                                                                                                                 \
+            }                                                                                                                     \
+            catch (...)                                                                                                           \
+            {                                                                                                                     \
+            }                                                                                                                     \
+        } while (false)
+        REGISTER_FIELD(FObjectProperty, &objectproperty_to_string);
+        REGISTER_FIELD(FObjectPtrProperty, &objectproperty_to_string);
+        REGISTER_FIELD(FAssetObjectProperty, &objectproperty_to_string);
+        REGISTER_FIELD(FAssetClassProperty, &classproperty_to_string);
+        REGISTER_FIELD(FInt8Property, &property_to_string);
+        REGISTER_FIELD(FInt16Property, &property_to_string);
+        REGISTER_FIELD(FIntProperty, &property_to_string);
+        REGISTER_FIELD(FInt64Property, &property_to_string);
+        REGISTER_FIELD(FByteProperty, &property_to_string);
+        REGISTER_FIELD(FUInt16Property, &property_to_string);
+        REGISTER_FIELD(FUInt32Property, &property_to_string);
+        REGISTER_FIELD(FUInt64Property, &property_to_string);
+        REGISTER_FIELD(FNameProperty, &property_to_string);
+        REGISTER_FIELD(FFloatProperty, &property_to_string);
+        REGISTER_FIELD(FBoolProperty, &boolproperty_to_string);
+        REGISTER_FIELD(FArrayProperty, &arrayproperty_to_string);
+        REGISTER_COMPLEX_FIELD(FArrayProperty, &arrayproperty_to_string_complex);
+        REGISTER_FIELD(FMapProperty, &mapproperty_to_string);
+        REGISTER_COMPLEX_FIELD(FMapProperty, &mapproperty_to_string_complex);
+        REGISTER_FIELD(FStructProperty, &structproperty_to_string);
+        REGISTER_FIELD(FClassProperty, &classproperty_to_string);
         if (Version::IsAtLeast(4, 18))
         {
-            object_to_string_functions[FSoftClassProperty::StaticClass().HashObject()] = &classproperty_to_string;
-            object_to_string_functions[FSoftObjectProperty::StaticClass().HashObject()] = &objectproperty_to_string;
+            REGISTER_FIELD(FSoftClassProperty, &classproperty_to_string);
+            REGISTER_FIELD(FSoftObjectProperty, &objectproperty_to_string);
         }
-        object_to_string_functions[FWeakObjectProperty::StaticClass().HashObject()] = &objectproperty_to_string;
-        object_to_string_functions[FLazyObjectProperty::StaticClass().HashObject()] = &objectproperty_to_string;
+        REGISTER_FIELD(FWeakObjectProperty, &objectproperty_to_string);
+        REGISTER_FIELD(FLazyObjectProperty, &objectproperty_to_string);
         if (Version::IsAtLeast(4, 15))
         {
-            object_to_string_functions[FEnumProperty::StaticClass().HashObject()] = &enumproperty_to_string;
+            REGISTER_FIELD(FEnumProperty, &enumproperty_to_string);
         }
-        object_to_string_functions[FTextProperty::StaticClass().HashObject()] = &property_to_string;
-        object_to_string_functions[FStrProperty::StaticClass().HashObject()] = &property_to_string;
-        object_to_string_functions[FDelegateProperty::StaticClass().HashObject()] = &delegateproperty_to_string;
-        object_to_string_functions[FMulticastDelegateProperty::StaticClass().HashObject()] = &multicastdelegateproperty_to_string;
+        REGISTER_FIELD(FTextProperty, &property_to_string);
+        REGISTER_FIELD(FStrProperty, &property_to_string);
+        REGISTER_FIELD(FDelegateProperty, &delegateproperty_to_string);
+        REGISTER_FIELD(FMulticastDelegateProperty, &multicastdelegateproperty_to_string);
         if (Version::IsAtLeast(4, 23))
         {
-            object_to_string_functions[FMulticastInlineDelegateProperty::StaticClass().HashObject()] = &multicastdelegateproperty_to_string;
-            object_to_string_functions[FMulticastSparseDelegateProperty::StaticClass().HashObject()] = &multicastdelegateproperty_to_string;
+            REGISTER_FIELD(FMulticastInlineDelegateProperty, &multicastdelegateproperty_to_string);
+            REGISTER_FIELD(FMulticastSparseDelegateProperty, &multicastdelegateproperty_to_string);
         }
-        object_to_string_functions[FInterfaceProperty::StaticClass().HashObject()] = &interfaceproperty_to_string;
+        REGISTER_FIELD(FInterfaceProperty, &interfaceproperty_to_string);
         if (Version::IsAtLeast(4, 25))
         {
-            object_to_string_functions[FFieldPathProperty::StaticClass().HashObject()] = &fieldpathproperty_to_string;
+            REGISTER_FIELD(FFieldPathProperty, &fieldpathproperty_to_string);
         }
+#undef REGISTER_COMPLEX_FIELD
+#undef REGISTER_FIELD
     }
 } // namespace RC::ObjectDumper

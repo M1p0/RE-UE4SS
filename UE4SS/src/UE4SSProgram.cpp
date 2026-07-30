@@ -893,6 +893,7 @@ namespace RC
             }
         });
 
+        config.bHookStaticConstructObject = settings_manager.Hooks.HookStaticConstructObject;
         config.bHookProcessInternal = settings_manager.Hooks.HookProcessInternal;
         config.bHookProcessLocalScriptFunction = settings_manager.Hooks.HookProcessLocalScriptFunction;
         config.bHookLoadMap = settings_manager.Hooks.HookLoadMap;
@@ -998,6 +999,13 @@ namespace RC
     {
         ProfilerScope();
         using namespace Unreal;
+
+        if (!Unreal::UnrealInitializer::StaticStorage::bIsInitialized)
+        {
+            Output::send<LogLevel::Warning>(
+                STR("[Init] Unreal diagnostic initialization is incomplete; skipping ObjectDumper, Lua, MCP, and runtime hooks for this run.\n"));
+            return;
+        }
 
         // Commented out because this system (turn off hotkeys when in-game console is open) it doesn't work properly.
         /*

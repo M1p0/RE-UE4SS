@@ -115,6 +115,7 @@ namespace RC
 
         struct SectionHooks
         {
+            bool HookStaticConstructObject{true};
             bool HookProcessInternal{true};
             bool HookProcessLocalScriptFunction{true};
             bool HookInitGameState{true};
