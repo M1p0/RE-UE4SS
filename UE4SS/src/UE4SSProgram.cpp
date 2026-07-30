@@ -7,6 +7,7 @@
 #endif
 
 #include <algorithm>
+#include <clocale>
 #include <cwctype>
 #include <format>
 #include <fstream>
@@ -560,6 +561,39 @@ namespace RC
                 freopen_s(&stdin_filename, "CONIN$", "r", stdin);
                 freopen_s(&stdout_filename, "CONOUT$", "w", stdout);
                 freopen_s(&stderr_filename, "CONOUT$", "w", stderr);
+
+                // UE4SS and the game share stdout/stderr. When a game writes
+                // wide strings through a narrow printf("%S") call, the CRT
+                // conversion locale and the console code page must agree.
+                // This is opt-in because the CRT locale is process-global.
+                const auto configured_code_page = settings_manager.Debug.SimpleConsoleCodePage;
+                if (configured_code_page > 0)
+                {
+                    if (configured_code_page <= std::numeric_limits<UINT>::max() &&
+                        IsValidCodePage(static_cast<UINT>(configured_code_page)))
+                    {
+                        const auto console_code_page = static_cast<UINT>(configured_code_page);
+                        const auto locale_name =
+                            console_code_page == CP_UTF8 ? std::wstring{L".UTF-8"} : std::format(L".{}", console_code_page);
+                        if (_wsetlocale(LC_CTYPE, locale_name.c_str()))
+                        {
+                            SetConsoleCP(console_code_page);
+                            SetConsoleOutputCP(console_code_page);
+                        }
+                        else
+                        {
+                            Output::send<LogLevel::Warning>(
+                                STR("ConsoleCodePage {} has no matching CRT locale; leaving console encoding unchanged.\n"),
+                                console_code_page);
+                        }
+                    }
+                    else
+                    {
+                        Output::send<LogLevel::Warning>(
+                            STR("ConsoleCodePage {} is invalid; leaving console encoding unchanged.\n"),
+                            configured_code_page);
+                    }
+                }
             }
         }
     }

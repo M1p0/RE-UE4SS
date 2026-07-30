@@ -134,6 +134,7 @@ namespace RC
 
         constexpr static File::CharType section_debug[] = STR("Debug");
         REGISTER_BOOL_SETTING(Debug.SimpleConsoleEnabled, section_debug, ConsoleEnabled)
+        REGISTER_INT64_SETTING(Debug.SimpleConsoleCodePage, section_debug, ConsoleCodePage)
         REGISTER_BOOL_SETTING(Debug.DebugConsoleEnabled, section_debug, GuiConsoleEnabled)
         REGISTER_BOOL_SETTING(Debug.DebugConsoleVisible, section_debug, GuiConsoleVisible)
         REGISTER_FLOAT_SETTING(Debug.DebugGUIFontScaling, section_debug, GuiConsoleFontScaling)

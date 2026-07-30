@@ -77,6 +77,7 @@ namespace RC
         struct SectionDebug
         {
             bool SimpleConsoleEnabled{true};
+            int64_t SimpleConsoleCodePage{};
             bool DebugConsoleEnabled{true};
             bool DebugConsoleVisible{true};
             float DebugGUIFontScaling{1.0};
