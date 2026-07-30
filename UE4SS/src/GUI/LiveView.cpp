@@ -1,8 +1,10 @@
 #include <algorithm>
+#include <cctype>
 #include <format>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <variant>
@@ -61,8 +63,10 @@ namespace RC::GUI
 
     static bool s_live_view_destructed = false;
     static std::unordered_map<const UObject*, std::string> s_object_ptr_to_full_name{};
+    static std::unordered_map<const UObject*, std::string> s_object_ptr_to_lower_full_name{};
 
     static std::mutex s_object_ptr_to_full_name_mutex{};
+    static std::mutex s_name_search_results_mutex{};
     std::mutex LiveView::Watch::s_watch_lock{};
 
     std::vector<LiveView::ObjectOrProperty> LiveView::s_object_view_history{{nullptr, nullptr, false}};
@@ -115,6 +119,52 @@ namespace RC::GUI
     static DeferredEnumEditPopup s_deferred_enum_edit_popup{};
 
     static auto get_object_full_name_cxx_string(UObject* object) -> std::string;
+    static auto get_object_lower_full_name_cxx_string(UObject* object) -> std::string;
+
+    struct PreparedNameSearch
+    {
+        std::string normalized_query{};
+        std::optional<std::regex> compiled_regex{};
+        bool is_valid{true};
+    };
+
+    static auto prepare_name_search(bool ignore_name) -> PreparedNameSearch
+    {
+        PreparedNameSearch prepared{};
+        if (ignore_name)
+        {
+            return prepared;
+        }
+
+        prepared.normalized_query = LiveView::s_name_to_search_by;
+        std::transform(prepared.normalized_query.begin(),
+                       prepared.normalized_query.end(),
+                       prepared.normalized_query.begin(),
+                       [](char c) {
+                           return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                       });
+
+        if (LiveView::s_use_regex_for_search)
+        {
+            try
+            {
+                prepared.compiled_regex.emplace(prepared.normalized_query);
+            }
+            catch (std::exception& e)
+            {
+                UE4SS_ERROR_OUTPUTTER()
+                LiveView::s_name_to_search_by.clear();
+                if (s_live_view)
+                {
+                    s_live_view->set_is_searching_by_name(false);
+                    s_live_view->set_search_field_clear_requested(true);
+                }
+                prepared.is_valid = false;
+            }
+        }
+
+        return prepared;
+    }
 
     static auto filter_out_objects(UObject* object) -> Filter::FilterResult
     {
@@ -133,7 +183,9 @@ namespace RC::GUI
         return RC_LIVE_VIEW_MAKE_FILTER_RETURN_VALUE(false, {});
     }
 
-    static auto attempt_to_add_search_result(UObject* object, bool ignore_name = false) -> Filter::FilterResult
+    static auto attempt_to_add_search_result(UObject* object,
+                                             bool ignore_name = false,
+                                             const PreparedNameSearch* prepared_search = nullptr) -> Filter::FilterResult
     {
         // TODO: Stop using the 'HashObject' function when needing the address of an FFieldClassVariant because it's not designed to return an address.
         //       Maybe make the ToFieldClass/ToUClass functions public (append 'Unsafe' to the function names).
@@ -143,14 +195,17 @@ namespace RC::GUI
             return RC_LIVE_VIEW_MAKE_FILTER_RETURN_VALUE(true, STR("Searched by name, but no name supplied"));
         }
 
-        std::string name_to_search_by{};
-        if (!ignore_name)
+        PreparedNameSearch local_prepared_search{};
+        if (!prepared_search)
         {
-            name_to_search_by = LiveView::s_name_to_search_by;
-            std::transform(name_to_search_by.begin(), name_to_search_by.end(), name_to_search_by.begin(), [](char c) {
-                return std::tolower(c);
-            });
+            local_prepared_search = prepare_name_search(ignore_name);
+            prepared_search = &local_prepared_search;
         }
+        if (!prepared_search->is_valid)
+        {
+            return RC_LIVE_VIEW_MAKE_FILTER_RETURN_VALUE(true, STR("Invalid search expression"));
+        }
+        const auto& name_to_search_by = prepared_search->normalized_query;
 
         if (const auto result = filter_out_objects(object); RC_LIVE_VIEW_WAS_FILTERED(result))
         {
@@ -161,10 +216,7 @@ namespace RC::GUI
         {
             for (UStruct* super : TSuperStructRange(object->GetClassPrivate()))
             {
-                auto super_full_name = get_object_full_name_cxx_string(super);
-                std::transform(super_full_name.begin(), super_full_name.end(), super_full_name.begin(), [](char c) {
-                    return std::tolower(c);
-                });
+                auto super_full_name = get_object_lower_full_name_cxx_string(super);
                 if (super_full_name.find(name_to_search_by) != super_full_name.npos)
                 {
                     LiveView::s_name_search_results.emplace_back(object);
@@ -179,27 +231,15 @@ namespace RC::GUI
             return RC_LIVE_VIEW_MAKE_FILTER_RETURN_VALUE(true, STR("Include inheritance, but object not inside result set"));
         }
 
-        auto object_full_name = get_object_full_name_cxx_string(object);
-        std::transform(object_full_name.begin(), object_full_name.end(), object_full_name.begin(), [](char c) {
-            return std::tolower(c);
-        });
+        auto object_full_name = get_object_lower_full_name_cxx_string(object);
 
         if (LiveView::s_use_regex_for_search && !ignore_name)
         {
-            try
+            if (prepared_search->compiled_regex &&
+                std::regex_search(object_full_name.begin(), object_full_name.end(), *prepared_search->compiled_regex))
             {
-                if (std::regex_search(object_full_name.begin(), object_full_name.end(), std::regex(name_to_search_by)))
-                {
-                    LiveView::s_name_search_results.emplace_back(object);
-                    LiveView::s_name_search_results_set.emplace(object);
-                }
-            }
-            catch (std::exception& e)
-            {
-                UE4SS_ERROR_OUTPUTTER()
-                LiveView::s_name_to_search_by.clear();
-                s_live_view->set_is_searching_by_name(false);
-                s_live_view->set_search_field_clear_requested(true);
+                LiveView::s_name_search_results.emplace_back(object);
+                LiveView::s_name_search_results_set.emplace(object);
             }
             return RC_LIVE_VIEW_MAKE_FILTER_RETURN_VALUE(false, STR("regex"));
         }
@@ -232,6 +272,7 @@ namespace RC::GUI
 
     static auto remove_search_result(UObject* object) -> void
     {
+        std::lock_guard lock{s_name_search_results_mutex};
         LiveView::s_name_search_results.erase(std::remove_if(LiveView::s_name_search_results.begin(),
                                                              LiveView::s_name_search_results.end(),
                                                              [&](const auto& item) {
@@ -276,6 +317,8 @@ namespace RC::GUI
             {
                 return;
             }
+            s_live_view->mark_object_snapshot_dirty();
+            std::lock_guard lock{s_name_search_results_mutex};
             attempt_to_add_search_result(std::bit_cast<UObject*>(object), LiveView::s_apply_search_filters_when_not_searching);
         }
 
@@ -298,6 +341,7 @@ namespace RC::GUI
                 return;
             }
 
+            s_live_view->mark_object_snapshot_dirty();
             auto as_uobject = std::bit_cast<UObject*>(object);
             if (LiveView::s_history_object_to_index.size() > 1)
             {
@@ -326,6 +370,7 @@ namespace RC::GUI
             {
                 std::lock_guard lock{s_object_ptr_to_full_name_mutex};
                 s_object_ptr_to_full_name.erase(as_uobject);
+                s_object_ptr_to_lower_full_name.erase(as_uobject);
             }
         }
 
@@ -808,6 +853,7 @@ namespace RC::GUI
         m_listeners_set = true;
         UObjectArray::AddUObjectCreateListener(&FLiveViewCreateListener::LiveViewCreateListener);
         UObjectArray::AddUObjectDeleteListener(&FLiveViewDeleteListener::LiveViewDeleteListener);
+        mark_object_snapshot_dirty();
     }
 
     auto LiveView::unset_listeners() -> void
@@ -819,6 +865,7 @@ namespace RC::GUI
         m_listeners_set = false;
         UObjectArray::RemoveUObjectCreateListener(&FLiveViewCreateListener::LiveViewCreateListener);
         UObjectArray::RemoveUObjectDeleteListener(&FLiveViewDeleteListener::LiveViewDeleteListener);
+        mark_object_snapshot_dirty();
     }
 
     LiveView::Watch::Watch(StringType&& object_name, StringType&& property_name) : object_name(object_name), property_name(property_name)
@@ -885,6 +932,84 @@ namespace RC::GUI
         });
     }
 
+    auto LiveView::refresh_live_object_snapshot() -> void
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const auto object_count = UObjectArray::GetNumElements();
+        const auto fallback_refresh_due =
+                !m_listeners_set && (m_last_object_snapshot_refresh.time_since_epoch().count() == 0 ||
+                                     now - m_last_object_snapshot_refresh >= m_object_snapshot_fallback_interval);
+        const auto snapshot_dirty = m_object_snapshot_dirty.load(std::memory_order_acquire);
+
+        if (!snapshot_dirty && object_count == m_snapshot_object_count && !fallback_refresh_due)
+        {
+            return;
+        }
+
+        // Clear the dirty flag before rebuilding. If a UObject is created or
+        // deleted while the snapshot is being rebuilt, its listener sets the
+        // flag again and the next GUI frame performs another rebuild.
+        m_object_snapshot_dirty.exchange(false, std::memory_order_acq_rel);
+
+        std::vector<int32_t> live_object_indices{};
+        std::unordered_map<UObject*, int32_t> live_object_positions{};
+        if (object_count > 0)
+        {
+            live_object_indices.reserve(static_cast<size_t>(object_count));
+            live_object_positions.reserve(static_cast<size_t>(object_count));
+        }
+
+        for (int32_t object_index = 0; object_index < object_count; ++object_index)
+        {
+            auto* object_item = FUObjectArray::IndexToObject(object_index);
+            if (!object_item || object_item->IsUnreachable())
+            {
+                continue;
+            }
+
+            auto* object = object_item->GetUObject();
+            if (!object)
+            {
+                continue;
+            }
+            if (s_need_to_filter_out_properties && object->IsA(std::bit_cast<UClass*>(FProperty::StaticClass().HashObject())))
+            {
+                continue;
+            }
+
+            const auto snapshot_index = static_cast<int32_t>(live_object_indices.size());
+            live_object_indices.emplace_back(object_index);
+            live_object_positions.emplace(object, snapshot_index);
+        }
+
+        m_live_object_indices.swap(live_object_indices);
+        m_live_object_positions.swap(live_object_positions);
+        m_snapshot_object_count = object_count;
+        m_last_object_snapshot_refresh = now;
+    }
+
+    auto LiveView::resolve_live_object(size_t snapshot_index) -> UObject*
+    {
+        if (snapshot_index >= m_live_object_indices.size())
+        {
+            return nullptr;
+        }
+
+        auto* object_item = FUObjectArray::IndexToObject(m_live_object_indices[snapshot_index]);
+        if (!object_item || object_item->IsUnreachable())
+        {
+            mark_object_snapshot_dirty();
+            return nullptr;
+        }
+
+        auto* object = object_item->GetUObject();
+        if (!object)
+        {
+            mark_object_snapshot_dirty();
+        }
+        return object;
+    }
+
     auto LiveView::select_object(size_t index, const FUObjectItem* object_item, UObject* object, AffectsHistory affects_history) -> void
     {
         if (object_item && object && affects_history == AffectsHistory::Yes)
@@ -946,6 +1071,32 @@ namespace RC::GUI
         }
     }
 
+    static auto get_object_lower_full_name_cxx_string(UObject* object) -> std::string
+    {
+        if (!UnrealInitializer::StaticStorage::bIsInitialized)
+        {
+            return "";
+        }
+
+        std::lock_guard lock{s_object_ptr_to_full_name_mutex};
+        if (auto it = s_object_ptr_to_lower_full_name.find(object); it != s_object_ptr_to_lower_full_name.end())
+        {
+            return it->second;
+        }
+
+        auto full_name = s_object_ptr_to_full_name.find(object);
+        if (full_name == s_object_ptr_to_full_name.end())
+        {
+            full_name = s_object_ptr_to_full_name.emplace(object, to_string(object->GetFullName())).first;
+        }
+
+        auto lower_full_name = full_name->second;
+        std::transform(lower_full_name.begin(), lower_full_name.end(), lower_full_name.begin(), [](char c) {
+            return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        });
+        return s_object_ptr_to_lower_full_name.emplace(object, std::move(lower_full_name)).first->second;
+    }
+
     auto LiveView::guobjectarray_by_name_iterator(int32_t int_data_1, int32_t int_data_2, const std::function<void(UObject*)>& callable) -> void
     {
         if (int_data_2 > s_name_search_results.size())
@@ -967,6 +1118,7 @@ namespace RC::GUI
         {
             Output::send(STR("Searching by name...\n"));
         }
+        std::lock_guard search_results_lock{s_name_search_results_mutex};
         s_name_search_results.clear();
         s_name_search_results_set.clear();
         Filter::s_highlighted_properties.clear();
@@ -988,8 +1140,14 @@ namespace RC::GUI
             }
         }
 
+        const auto prepared_search = prepare_name_search(ignore_name);
+        if (!prepared_search.is_valid)
+        {
+            return;
+        }
+
         UObjectGlobals::ForEachUObject([&](UObject* object, ...) {
-            const auto was_added = attempt_to_add_search_result(object, ignore_name);
+            const auto was_added = attempt_to_add_search_result(object, ignore_name, &prepared_search);
 #if RC_LIVE_VIEW_DEBUG_FILTER_RESULTS
             if (ignore_name)
             {
@@ -3244,6 +3402,7 @@ namespace RC::GUI
         {
             StringType result{};
             auto is_below_425 = Version::IsBelow(4, 25);
+            std::lock_guard search_results_lock{s_name_search_results_mutex};
             for (const auto& search_result : s_name_search_results)
             {
                 UE4SSProgram::dump_uobject(search_result, nullptr, result, is_below_425);
@@ -3264,129 +3423,91 @@ namespace RC::GUI
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4{0.156f, 0.156f, 0.156f, 1.0f});
         ImGui::BeginChild("LiveView_TreeView", {-16.0f, m_top_size}, true);
 
-        auto do_iteration = [&](int start, int end, const std::vector<UObject*>* objects_to_draw_ptr = nullptr) {
-            if (!objects_to_draw_ptr || objects_to_draw_ptr->empty())
+        std::unique_lock<std::mutex> search_results_lock{};
+        if (m_is_searching_by_name)
+        {
+            search_results_lock = std::unique_lock{s_name_search_results_mutex};
+        }
+
+        auto render_object = [&](UObject* object) {
+            if (!object)
             {
-                // 1) If there's no valid pointer or it's empty, do old logic
-                ((*this).*((*this).m_object_iterator))(start, end, [&](UObject* object) {
-                    auto tree_node_name = std::string{get_object_full_name(object)};
-
-                    if (ImGui_TreeNodeEx(tree_node_name.c_str(), object))
-                    {
-                        m_currently_opened_tree_node = object;
-                        m_opened_tree_nodes.emplace(object);
-
-                        // The menu must be rendered both if the node is open and if it's closed.
-                        render_context_menu(tree_node_name, object);
-
-                        if (auto as_struct = Cast<UStruct>(object); as_struct)
-                        {
-                            render_struct_sub_tree_hierarchy(as_struct);
-                        }
-                        else
-                        {
-                            render_object_sub_tree_hierarchy(object);
-                        }
-
-                        ImGui::TreePop();
-                    }
-                    else
-                    {
-                        // Handle item-click selection
-                        if (ImGui::IsItemClicked())
-                        {
-                            select_object(0, object->GetObjectItem(), object, AffectsHistory::Yes);
-                        }
-                    }
-                    collapse_all_except(m_currently_opened_tree_node);
-                    render_context_menu(tree_node_name, object);
-                });
+                return;
             }
-            else
+
+            auto tree_node_name = std::string{get_object_full_name(object)};
+            if (ImGui_TreeNodeEx(tree_node_name.c_str(), object))
             {
-                // 2) Otherwise, draw the filtered objects directly
-                const auto& objects_to_draw = *objects_to_draw_ptr;
-                for (int i = start; i < end; i++)
+                m_currently_opened_tree_node = object;
+                m_opened_tree_nodes.emplace(object);
+
+                render_context_menu(tree_node_name, object);
+                if (auto as_struct = Cast<UStruct>(object); as_struct)
                 {
-                    UObject* object = objects_to_draw[i];
-                    if (!object) continue;
-
-                    auto tree_node_name = std::string{get_object_full_name(object)};
-
-                    if (ImGui_TreeNodeEx(tree_node_name.c_str(), object))
-                    {
-                        m_currently_opened_tree_node = object;
-                        m_opened_tree_nodes.emplace(object);
-
-                        render_context_menu(tree_node_name, object);
-
-                        if (auto as_struct = Cast<UStruct>(object); as_struct)
-                        {
-                            render_struct_sub_tree_hierarchy(as_struct);
-                        }
-                        else
-                        {
-                            render_object_sub_tree_hierarchy(object);
-                        }
-
-                        ImGui::TreePop();
-                    }
-                    else
-                    {
-                        // Handle item-click selection
-                        if (ImGui::IsItemClicked())
-                        {
-                            select_object(0, object->GetObjectItem(), object, AffectsHistory::Yes);
-                        }
-                    }
-                    collapse_all_except(m_currently_opened_tree_node);
-                    render_context_menu(tree_node_name, object);
+                    render_struct_sub_tree_hierarchy(as_struct);
                 }
+                else
+                {
+                    render_object_sub_tree_hierarchy(object);
+                }
+                ImGui::TreePop();
+            }
+            else if (ImGui::IsItemClicked())
+            {
+                select_object(0, object->GetObjectItem(), object, AffectsHistory::Yes);
+            }
+            collapse_all_except(m_currently_opened_tree_node);
+            render_context_menu(tree_node_name, object);
+        };
+
+        auto do_iteration = [&](int start, int end, auto&& resolve_object) {
+            for (int item_index = start; item_index < end; ++item_index)
+            {
+                render_object(resolve_object(static_cast<size_t>(item_index)));
             }
         };
 
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {0.0f, 0.0f});
 
-        // 1) Gather objects you actually want to draw
-        std::vector<UObject*> objects_to_draw;
-
+        size_t object_count{};
         if (m_is_searching_by_name)
         {
-            // If we are searching by name, presumably `s_name_search_results`
-            // already holds only valid objects.
-            objects_to_draw = s_name_search_results;
+            // Use the search-result vector in place instead of copying it on
+            // every GUI frame.
+            object_count = s_name_search_results.size();
         }
         else
         {
-            // Otherwise, filter the entire UObjectArray
-            objects_to_draw.reserve(UObjectArray::GetNumElements());
-            for (size_t i = 0; i < UObjectArray::GetNumElements(); i++)
-            {
+            // UObject listeners invalidate this persistent index snapshot.
+            // Without listeners, a low-frequency fallback refresh is used.
+            refresh_live_object_snapshot();
+            object_count = m_live_object_indices.size();
+        }
 
-                if (FUObjectItem* obj = FUObjectArray::IndexToObject(i))
+        ImGuiListClipper clipper{};
+        clipper.Begin(static_cast<int>(object_count), ImGui::GetTextLineHeightWithSpacing());
+
+        // Keep the opened node rendered. The normal view uses an O(1)
+        // pointer-to-position map instead of scanning all objects again.
+        if (m_currently_opened_tree_node)
+        {
+            if (m_is_searching_by_name)
+            {
+                const auto opened_object =
+                        std::find(s_name_search_results.begin(), s_name_search_results.end(), m_currently_opened_tree_node);
+                if (opened_object != s_name_search_results.end())
                 {
-                    // Skip destroyed/invalid objects here
-                    if (!obj->IsUnreachable())
-                    {
-                        objects_to_draw.push_back(obj->GetUObject());
-                    }
+                    const auto opened_index = static_cast<int>(std::distance(s_name_search_results.begin(), opened_object));
+                    clipper.IncludeItemsByIndex(opened_index, opened_index + 1);
                 }
             }
-        }
-
-        // 2) Use clipper with the filtered array size
-        ImGuiListClipper clipper{};
-        clipper.Begin(objects_to_draw.size(), ImGui::GetTextLineHeightWithSpacing());
-
-        // Forces the current opened node to always be rendered by the clipper
-        for (int i = 0; i < objects_to_draw.size(); i++)
-        {
-            if (objects_to_draw[i] == m_currently_opened_tree_node)
+            else if (const auto opened_object = m_live_object_positions.find(m_currently_opened_tree_node);
+                     opened_object != m_live_object_positions.end())
             {
-                clipper.IncludeItemsByIndex(i, i + 1);
-                break;
+                clipper.IncludeItemsByIndex(opened_object->second, opened_object->second + 1);
             }
         }
+
         int last_display_end = 0;
         float last_position = ImGui::GetCursorPosY();
         while (clipper.Step())
@@ -3397,7 +3518,18 @@ namespace RC::GUI
                 ImGui::SetCursorPosY(last_position);
                 clipper.DisplayStart = last_display_end;
             }
-            do_iteration(clipper.DisplayStart, clipper.DisplayEnd, &objects_to_draw);
+            if (m_is_searching_by_name)
+            {
+                do_iteration(clipper.DisplayStart, clipper.DisplayEnd, [](size_t search_result_index) -> UObject* {
+                    return search_result_index < s_name_search_results.size() ? s_name_search_results[search_result_index] : nullptr;
+                });
+            }
+            else
+            {
+                do_iteration(clipper.DisplayStart, clipper.DisplayEnd, [&](size_t snapshot_index) -> UObject* {
+                    return resolve_live_object(snapshot_index);
+                });
+            }
             last_position = ImGui::GetCursorPosY();
             last_display_end = clipper.DisplayEnd;
         }

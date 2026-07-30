@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <unordered_map>
@@ -83,8 +85,14 @@ namespace RC::GUI
       private:
         std::string_view m_default_search_buffer{"Search by type, path, and name..."};
         constexpr static size_t m_search_buffer_capacity = 2000;
+        constexpr static auto m_object_snapshot_fallback_interval = std::chrono::milliseconds{250};
         char* m_search_by_name_buffer{};
         ObjectIteratorCallable m_object_iterator{&LiveView::guobjectarray_iterator};
+        std::vector<int32_t> m_live_object_indices{};
+        std::unordered_map<UObject*, int32_t> m_live_object_positions{};
+        std::chrono::steady_clock::time_point m_last_object_snapshot_refresh{};
+        std::atomic_bool m_object_snapshot_dirty{true};
+        int32_t m_snapshot_object_count{-1};
         std::unordered_set<UObject*> m_opened_tree_nodes{};
         UObject* m_currently_opened_tree_node{};
         std::string m_current_property_value_buffer{};
@@ -166,6 +174,8 @@ namespace RC::GUI
         };
 
       private:
+        auto refresh_live_object_snapshot() -> void;
+        auto resolve_live_object(size_t snapshot_index) -> UObject*;
         auto render_info_panel() -> void;
         auto render_info_panel_as_object(const FUObjectItem*, UObject*) -> void;
         auto render_info_panel_as_property(FProperty*) -> void;
@@ -233,6 +243,10 @@ namespace RC::GUI
         auto set_listeners_allowed(bool new_value) -> void
         {
             m_listeners_allowed = new_value;
+        }
+        auto mark_object_snapshot_dirty() noexcept -> void
+        {
+            m_object_snapshot_dirty.store(true, std::memory_order_release);
         }
         auto are_listeners_allowed() -> bool
         {
