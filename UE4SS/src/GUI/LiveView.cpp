@@ -317,7 +317,7 @@ namespace RC::GUI
             {
                 return;
             }
-            s_live_view->mark_object_snapshot_dirty();
+            s_live_view->queue_live_object_change(index, true);
             std::lock_guard lock{s_name_search_results_mutex};
             attempt_to_add_search_result(std::bit_cast<UObject*>(object), LiveView::s_apply_search_filters_when_not_searching);
         }
@@ -341,7 +341,7 @@ namespace RC::GUI
                 return;
             }
 
-            s_live_view->mark_object_snapshot_dirty();
+            s_live_view->queue_live_object_change(index, false);
             auto as_uobject = std::bit_cast<UObject*>(object);
             if (LiveView::s_history_object_to_index.size() > 1)
             {
@@ -932,31 +932,22 @@ namespace RC::GUI
         });
     }
 
-    auto LiveView::refresh_live_object_snapshot() -> void
+    auto LiveView::rebuild_live_object_snapshot(std::chrono::steady_clock::time_point now) -> void
     {
-        const auto now = std::chrono::steady_clock::now();
+        const auto rebuild_start = std::chrono::steady_clock::now();
         const auto object_count = UObjectArray::GetNumElements();
-        const auto fallback_refresh_due =
-                !m_listeners_set && (m_last_object_snapshot_refresh.time_since_epoch().count() == 0 ||
-                                     now - m_last_object_snapshot_refresh >= m_object_snapshot_fallback_interval);
-        const auto snapshot_dirty = m_object_snapshot_dirty.load(std::memory_order_acquire);
-
-        if (!snapshot_dirty && object_count == m_snapshot_object_count && !fallback_refresh_due)
         {
-            return;
+            // Changes already queued before this scan are represented by the
+            // full rebuild. Events arriving during the scan remain queued and
+            // are applied incrementally on the next GUI frame.
+            std::lock_guard lock{m_pending_object_changes_mutex};
+            m_pending_object_changes.clear();
         }
 
-        // Clear the dirty flag before rebuilding. If a UObject is created or
-        // deleted while the snapshot is being rebuilt, its listener sets the
-        // flag again and the next GUI frame performs another rebuild.
-        m_object_snapshot_dirty.exchange(false, std::memory_order_acq_rel);
-
         std::vector<int32_t> live_object_indices{};
-        std::unordered_map<UObject*, int32_t> live_object_positions{};
         if (object_count > 0)
         {
             live_object_indices.reserve(static_cast<size_t>(object_count));
-            live_object_positions.reserve(static_cast<size_t>(object_count));
         }
 
         for (int32_t object_index = 0; object_index < object_count; ++object_index)
@@ -977,15 +968,164 @@ namespace RC::GUI
                 continue;
             }
 
-            const auto snapshot_index = static_cast<int32_t>(live_object_indices.size());
             live_object_indices.emplace_back(object_index);
-            live_object_positions.emplace(object, snapshot_index);
         }
 
         m_live_object_indices.swap(live_object_indices);
-        m_live_object_positions.swap(live_object_positions);
         m_snapshot_object_count = object_count;
         m_last_object_snapshot_refresh = now;
+
+        ++m_snapshot_full_rebuild_count;
+        m_snapshot_full_rebuild_ms +=
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rebuild_start).count();
+    }
+
+    auto LiveView::apply_pending_live_object_changes(std::chrono::steady_clock::time_point now) -> bool
+    {
+        std::vector<PendingObjectChange> changes{};
+        {
+            std::lock_guard lock{m_pending_object_changes_mutex};
+            changes.swap(m_pending_object_changes);
+        }
+        if (changes.empty())
+        {
+            return false;
+        }
+
+        const auto update_start = std::chrono::steady_clock::now();
+        const auto event_count = changes.size();
+
+        // Preserve callback order for repeated reuse of the same GUObjectArray
+        // index, then keep only the final state of each changed index.
+        std::stable_sort(changes.begin(), changes.end(), [](const PendingObjectChange& lhs, const PendingObjectChange& rhs) {
+            return lhs.object_index < rhs.object_index;
+        });
+
+        std::vector<PendingObjectChange> final_changes{};
+        final_changes.reserve(changes.size());
+        for (size_t change_index = 0; change_index < changes.size();)
+        {
+            size_t next_change_index = change_index + 1;
+            while (next_change_index < changes.size() && changes[next_change_index].object_index == changes[change_index].object_index)
+            {
+                ++next_change_index;
+            }
+            final_changes.emplace_back(changes[next_change_index - 1]);
+            change_index = next_change_index;
+        }
+
+        std::vector<int32_t> updated_indices{};
+        updated_indices.reserve(m_live_object_indices.size() + final_changes.size());
+        size_t live_index{};
+
+        const auto append_created_object = [&](const PendingObjectChange& change) {
+            if (!change.was_created)
+            {
+                return;
+            }
+            auto* object_item = FUObjectArray::IndexToObject(change.object_index);
+            if (!object_item || object_item->IsUnreachable())
+            {
+                return;
+            }
+            auto* object = object_item->GetUObject();
+            if (!object)
+            {
+                return;
+            }
+            if (s_need_to_filter_out_properties && object->IsA(std::bit_cast<UClass*>(FProperty::StaticClass().HashObject())))
+            {
+                return;
+            }
+            updated_indices.emplace_back(change.object_index);
+        };
+
+        for (const auto& change : final_changes)
+        {
+            while (live_index < m_live_object_indices.size() && m_live_object_indices[live_index] < change.object_index)
+            {
+                updated_indices.emplace_back(m_live_object_indices[live_index++]);
+            }
+            if (live_index < m_live_object_indices.size() && m_live_object_indices[live_index] == change.object_index)
+            {
+                ++live_index;
+            }
+            append_created_object(change);
+        }
+        updated_indices.insert(updated_indices.end(), m_live_object_indices.begin() + static_cast<ptrdiff_t>(live_index), m_live_object_indices.end());
+
+        m_live_object_indices.swap(updated_indices);
+        m_snapshot_object_count = UObjectArray::GetNumElements();
+        m_last_object_snapshot_refresh = now;
+        ++m_snapshot_incremental_batch_count;
+        m_snapshot_incremental_event_count += event_count;
+        m_snapshot_incremental_update_ms +=
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - update_start).count();
+        return true;
+    }
+
+    auto LiveView::log_live_object_snapshot_perf(std::chrono::steady_clock::time_point now) -> void
+    {
+        if (m_snapshot_perf_window_start.time_since_epoch().count() == 0)
+        {
+            m_snapshot_perf_window_start = now;
+            return;
+        }
+        if (now - m_snapshot_perf_window_start < m_object_snapshot_perf_interval)
+        {
+            return;
+        }
+
+        size_t pending_event_count{};
+        {
+            std::lock_guard lock{m_pending_object_changes_mutex};
+            pending_event_count = m_pending_object_changes.size();
+        }
+        Output::send(STR("[LiveViewPerf] objects={} full_rebuilds={} full_ms={:.3f} incremental_batches={} incremental_events={} incremental_ms={:.3f} pending={}\n"),
+                     m_live_object_indices.size(),
+                     m_snapshot_full_rebuild_count,
+                     m_snapshot_full_rebuild_ms,
+                     m_snapshot_incremental_batch_count,
+                     m_snapshot_incremental_event_count,
+                     m_snapshot_incremental_update_ms,
+                     pending_event_count);
+
+        m_snapshot_perf_window_start = now;
+        m_snapshot_full_rebuild_count = 0;
+        m_snapshot_incremental_batch_count = 0;
+        m_snapshot_incremental_event_count = 0;
+        m_snapshot_full_rebuild_ms = 0.0;
+        m_snapshot_incremental_update_ms = 0.0;
+    }
+
+    auto LiveView::refresh_live_object_snapshot() -> void
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const auto object_count = UObjectArray::GetNumElements();
+        const auto force_rebuild = m_object_snapshot_dirty.exchange(false, std::memory_order_acq_rel);
+
+        if (force_rebuild)
+        {
+            rebuild_live_object_snapshot(now);
+        }
+        else if (m_listeners_set)
+        {
+            const auto applied_changes = apply_pending_live_object_changes(now);
+            if (!applied_changes && object_count != m_snapshot_object_count)
+            {
+                // Listener delivery should account for count changes. Rebuild
+                // only as a recovery path if an event was missed.
+                rebuild_live_object_snapshot(now);
+            }
+        }
+        else if (object_count != m_snapshot_object_count ||
+                 m_last_object_snapshot_refresh.time_since_epoch().count() == 0 ||
+                 now - m_last_object_snapshot_refresh >= m_object_snapshot_fallback_interval)
+        {
+            rebuild_live_object_snapshot(now);
+        }
+
+        log_live_object_snapshot_perf(now);
     }
 
     auto LiveView::resolve_live_object(size_t snapshot_index) -> UObject*
@@ -998,14 +1138,28 @@ namespace RC::GUI
         auto* object_item = FUObjectArray::IndexToObject(m_live_object_indices[snapshot_index]);
         if (!object_item || object_item->IsUnreachable())
         {
-            mark_object_snapshot_dirty();
+            if (m_listeners_set)
+            {
+                queue_live_object_change(m_live_object_indices[snapshot_index], false);
+            }
+            else
+            {
+                mark_object_snapshot_dirty();
+            }
             return nullptr;
         }
 
         auto* object = object_item->GetUObject();
         if (!object)
         {
-            mark_object_snapshot_dirty();
+            if (m_listeners_set)
+            {
+                queue_live_object_change(m_live_object_indices[snapshot_index], false);
+            }
+            else
+            {
+                mark_object_snapshot_dirty();
+            }
         }
         return object;
     }
@@ -3439,6 +3593,7 @@ namespace RC::GUI
             if (ImGui_TreeNodeEx(tree_node_name.c_str(), object))
             {
                 m_currently_opened_tree_node = object;
+                m_currently_opened_tree_node_object_index = object->GetInternalIndex();
                 m_opened_tree_nodes.emplace(object);
 
                 render_context_menu(tree_node_name, object);
@@ -3501,10 +3656,16 @@ namespace RC::GUI
                     clipper.IncludeItemsByIndex(opened_index, opened_index + 1);
                 }
             }
-            else if (const auto opened_object = m_live_object_positions.find(m_currently_opened_tree_node);
-                     opened_object != m_live_object_positions.end())
+            else if (m_currently_opened_tree_node_object_index >= 0)
             {
-                clipper.IncludeItemsByIndex(opened_object->second, opened_object->second + 1);
+                const auto opened_object = std::lower_bound(m_live_object_indices.begin(),
+                                                            m_live_object_indices.end(),
+                                                            m_currently_opened_tree_node_object_index);
+                if (opened_object != m_live_object_indices.end() && *opened_object == m_currently_opened_tree_node_object_index)
+                {
+                    const auto opened_index = static_cast<int>(std::distance(m_live_object_indices.begin(), opened_object));
+                    clipper.IncludeItemsByIndex(opened_index, opened_index + 1);
+                }
             }
         }
 

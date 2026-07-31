@@ -4,6 +4,7 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
@@ -83,18 +84,33 @@ namespace RC::GUI
         };
 
       private:
+        struct PendingObjectChange
+        {
+            int32_t object_index{};
+            bool was_created{};
+        };
+
         std::string_view m_default_search_buffer{"Search by type, path, and name..."};
         constexpr static size_t m_search_buffer_capacity = 2000;
-        constexpr static auto m_object_snapshot_fallback_interval = std::chrono::milliseconds{250};
+        constexpr static auto m_object_snapshot_fallback_interval = std::chrono::seconds{2};
+        constexpr static auto m_object_snapshot_perf_interval = std::chrono::seconds{5};
         char* m_search_by_name_buffer{};
         ObjectIteratorCallable m_object_iterator{&LiveView::guobjectarray_iterator};
         std::vector<int32_t> m_live_object_indices{};
-        std::unordered_map<UObject*, int32_t> m_live_object_positions{};
+        std::mutex m_pending_object_changes_mutex{};
+        std::vector<PendingObjectChange> m_pending_object_changes{};
         std::chrono::steady_clock::time_point m_last_object_snapshot_refresh{};
+        std::chrono::steady_clock::time_point m_snapshot_perf_window_start{};
         std::atomic_bool m_object_snapshot_dirty{true};
         int32_t m_snapshot_object_count{-1};
+        uint64_t m_snapshot_full_rebuild_count{};
+        uint64_t m_snapshot_incremental_batch_count{};
+        uint64_t m_snapshot_incremental_event_count{};
+        double m_snapshot_full_rebuild_ms{};
+        double m_snapshot_incremental_update_ms{};
         std::unordered_set<UObject*> m_opened_tree_nodes{};
         UObject* m_currently_opened_tree_node{};
+        int32_t m_currently_opened_tree_node_object_index{-1};
         std::string m_current_property_value_buffer{};
         int64_t m_current_enum_value_buffer{};
         float m_top_size{300.0f};
@@ -175,6 +191,9 @@ namespace RC::GUI
 
       private:
         auto refresh_live_object_snapshot() -> void;
+        auto rebuild_live_object_snapshot(std::chrono::steady_clock::time_point now) -> void;
+        auto apply_pending_live_object_changes(std::chrono::steady_clock::time_point now) -> bool;
+        auto log_live_object_snapshot_perf(std::chrono::steady_clock::time_point now) -> void;
         auto resolve_live_object(size_t snapshot_index) -> UObject*;
         auto render_info_panel() -> void;
         auto render_info_panel_as_object(const FUObjectItem*, UObject*) -> void;
@@ -247,6 +266,11 @@ namespace RC::GUI
         auto mark_object_snapshot_dirty() noexcept -> void
         {
             m_object_snapshot_dirty.store(true, std::memory_order_release);
+        }
+        auto queue_live_object_change(int32_t object_index, bool was_created) -> void
+        {
+            std::lock_guard lock{m_pending_object_changes_mutex};
+            m_pending_object_changes.emplace_back(object_index, was_created);
         }
         auto are_listeners_allowed() -> bool
         {
