@@ -64,3 +64,8 @@ The HTTP server binds to `127.0.0.1` and serves `/mcp`. Set `UE4SS_MCP_HTTP_TOKE
 - `ue4ss.run_lua`
 
 `ue4ss.run_lua` is a developer-mode capability. It is intentionally protected by the UE4SS bridge token and audited in the UE4SS log.
+
+Every request is dispatched to GameThread before Lua executes. The response reports
+`gameThread: true` as the actual execution context and echoes the deprecated input
+as `requestedGameThread`; the input no longer creates a second deferred queue hop,
+so Lua return values remain synchronous for both `true` and `false` callers.

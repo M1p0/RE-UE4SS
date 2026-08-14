@@ -1524,23 +1524,17 @@ namespace RC::MCP
             throw std::runtime_error{"lua_mod_not_found"};
         }
 
-        const auto game_thread = get_bool(params, "gameThread", false);
-        std::string script_to_run = script;
-        if (game_thread)
-        {
-            script_to_run = std::format(
-                    "ExecuteInGameThread(function()\n"
-                    "  local ok, err = pcall(function()\n{}\n  end)\n"
-                    "  if not ok then print('[MCP LuaEval] ' .. tostring(err)) end\n"
-                    "end)",
-                    script);
-        }
+        // MCP requests already enter handle_request through dispatch_on_game_thread().
+        // Keep accepting the legacy request flag, but never add a second deferred
+        // ExecuteInGameThread hop: that loses synchronous return values and can
+        // leave a stale Lua function reference when the target mod is reloaded.
+        const auto requested_game_thread = get_bool(params, "gameThread", false);
 
         std::lock_guard guard{LuaMod::m_thread_actions_mutex};
         lua_State* L = mod->lua().get_lua_state();
         const int base = lua_gettop(L);
 
-        if (int status = luaL_loadstring(L, script_to_run.c_str()); status != LUA_OK)
+        if (int status = luaL_loadstring(L, script.c_str()); status != LUA_OK)
         {
             const auto error = lua_tostring(L, -1);
             lua_settop(L, base);
@@ -1567,10 +1561,11 @@ namespace RC::MCP
         values += ']';
         lua_settop(L, base);
 
-        return std::format("{{\"modName\":{},\"gameThread\":{},\"queued\":{},\"returns\":{}}}",
+        return std::format("{{\"modName\":{},\"gameThread\":true,\"requestedGameThread\":{},\"deferred\":{},\"queued\":{},\"returns\":{}}}",
                            json_string(to_string(mod->get_name())),
-                           bool_json(game_thread),
-                           bool_json(game_thread),
+                           bool_json(requested_game_thread),
+                           bool_json(false),
+                           bool_json(false),
                            values);
     }
 

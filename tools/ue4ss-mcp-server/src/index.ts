@@ -334,7 +334,7 @@ function registerTools(server: McpServer, bridge: UE4SSBridgeClient) {
     "ue4ss.run_lua",
     {
       title: "Run Lua",
-      description: "Execute Lua in a running UE4SS Lua mod. Use gameThread=true to queue through ExecuteInGameThread.",
+      description: "Execute Lua synchronously in a running UE4SS Lua mod on GameThread. gameThread is a legacy compatibility flag and does not add another queue hop.",
       inputSchema: {
         script: z.string(),
         modName: z.string().optional(),
