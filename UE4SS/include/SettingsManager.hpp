@@ -106,7 +106,6 @@ namespace RC
         {
             bool Enabled{false};
             File::StringType PipeName{};
-            File::StringType AuthToken{};
             bool AllowLuaEval{true};
             int64_t MaxResultCount{200};
             int64_t MaxSerializeDepth{3};

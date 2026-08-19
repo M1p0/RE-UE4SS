@@ -9,7 +9,6 @@ Enable the bridge in `UE4SS-settings.ini`:
 ```ini
 [MCP]
 Enabled = 1
-AuthToken = replace-with-a-local-secret
 AllowLuaEval = 1
 ```
 
@@ -27,14 +26,13 @@ npm run build
 Use this mode from an MCP host that launches servers as subprocesses:
 
 ```powershell
-node .\dist\index.js --pipe UE4SS-MCP-12345 --token replace-with-a-local-secret
+node .\dist\index.js --pipe UE4SS-MCP-12345
 ```
 
 You can also use environment variables:
 
 ```powershell
 $env:UE4SS_MCP_PIPE = "UE4SS-MCP-12345"
-$env:UE4SS_MCP_TOKEN = "replace-with-a-local-secret"
 node .\dist\index.js
 ```
 
@@ -43,10 +41,10 @@ The stdio transport writes only MCP JSON-RPC messages to stdout. Logs go to stde
 ## local HTTP transport
 
 ```powershell
-node .\dist\index.js --transport http --http-port 8765 --pipe UE4SS-MCP-12345 --token replace-with-a-local-secret
+node .\dist\index.js --transport http --http-port 8765 --pipe UE4SS-MCP-12345
 ```
 
-The HTTP server binds to `127.0.0.1` and serves `/mcp`. Set `UE4SS_MCP_HTTP_TOKEN` or pass `--http-token` to require a Bearer token from HTTP MCP clients.
+The HTTP server binds to `127.0.0.1` and serves `/mcp` without authentication.
 
 ## Tools
 
@@ -63,7 +61,7 @@ The HTTP server binds to `127.0.0.1` and serves `/mcp`. Set `UE4SS_MCP_HTTP_TOKE
 - `ue4ss.events_recent`
 - `ue4ss.run_lua`
 
-`ue4ss.run_lua` is a developer-mode capability. It is intentionally protected by the UE4SS bridge token and audited in the UE4SS log.
+`ue4ss.run_lua` is a developer-mode capability and is audited in the UE4SS log.
 
 Every request is dispatched to GameThread before Lua executes. The response reports
 `gameThread: true` as the actual execution context and echoes the deprecated input

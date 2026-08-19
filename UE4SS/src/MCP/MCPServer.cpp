@@ -486,17 +486,10 @@ namespace RC::MCP
 
         m_config.enabled = settings.Enabled;
         m_config.pipe_name = settings.PipeName.empty() ? std::format("UE4SS-MCP-{}", GetCurrentProcessId()) : to_string(settings.PipeName);
-        m_config.auth_token = to_string(settings.AuthToken);
         m_config.allow_lua_eval = settings.AllowLuaEval;
         m_config.max_result_count = static_cast<size_t>(std::max<int64_t>(1, settings.MaxResultCount));
         m_config.max_serialize_depth = static_cast<size_t>(std::max<int64_t>(1, settings.MaxSerializeDepth));
         m_config.audit_log_enabled = settings.AuditLogEnabled;
-
-        if (m_config.auth_token.empty())
-        {
-            Output::send<LogLevel::Error>(STR("[MCP] Refusing to start because MCP.AuthToken is empty.\n"));
-            return;
-        }
 
         if (!install_game_thread_pump())
         {
@@ -637,13 +630,6 @@ namespace RC::MCP
             if (const auto id_it = root.find("id"); id_it != root.end())
             {
                 id_json = write_generic_json(id_it->second);
-            }
-
-            const auto token = get_string(root, "token");
-            if (token != m_config.auth_token)
-            {
-                audit("auth", "rejected");
-                return make_error(id_json, "unauthorized", "Invalid MCP bridge token.");
             }
 
             const auto method = get_string(root, "method");

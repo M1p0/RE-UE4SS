@@ -42,7 +42,6 @@ namespace RC::MCP
         {
             bool enabled{false};
             std::string pipe_name{};
-            std::string auth_token{};
             bool allow_lua_eval{true};
             size_t max_result_count{200};
             size_t max_serialize_depth{3};

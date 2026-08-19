@@ -177,7 +177,6 @@ namespace RC
         constexpr static File::CharType section_mcp[] = STR("MCP");
         REGISTER_BOOL_SETTING(MCP.Enabled, section_mcp, Enabled)
         REGISTER_STRING_SETTING(MCP.PipeName, section_mcp, PipeName)
-        REGISTER_STRING_SETTING(MCP.AuthToken, section_mcp, AuthToken)
         REGISTER_BOOL_SETTING(MCP.AllowLuaEval, section_mcp, AllowLuaEval)
         REGISTER_INT64_SETTING(MCP.MaxResultCount, section_mcp, MaxResultCount)
         REGISTER_INT64_SETTING(MCP.MaxSerializeDepth, section_mcp, MaxSerializeDepth)

@@ -16,10 +16,8 @@ type BridgeResponse =
 
 type CliConfig = {
   pipe: string;
-  token: string;
   transport: "stdio" | "http";
   httpPort: number;
-  httpToken?: string;
 };
 
 const REQUEST_TIMEOUT_MS = 10_000;
@@ -44,16 +42,11 @@ function readConfig(): CliConfig {
     argValue("--pipe") ??
     process.env.UE4SS_MCP_PIPE ??
     (pipeFromPid ? `UE4SS-MCP-${pipeFromPid}` : undefined);
-  const token = argValue("--token") ?? process.env.UE4SS_MCP_TOKEN;
   const transport = (argValue("--transport") ?? process.env.UE4SS_MCP_TRANSPORT ?? "stdio").toLowerCase();
   const httpPort = Number(argValue("--http-port") ?? process.env.UE4SS_MCP_HTTP_PORT ?? "8765");
-  const httpToken = argValue("--http-token") ?? process.env.UE4SS_MCP_HTTP_TOKEN;
 
   if (!pipe) {
     throw new Error("Missing UE4SS MCP pipe. Pass --pipe UE4SS-MCP-<pid> or set UE4SS_MCP_PIPE.");
-  }
-  if (!token) {
-    throw new Error("Missing UE4SS MCP token. Pass --token <token> or set UE4SS_MCP_TOKEN.");
   }
   if (transport !== "stdio" && transport !== "http") {
     throw new Error(`Unsupported transport '${transport}'. Use stdio or http.`);
@@ -64,19 +57,17 @@ function readConfig(): CliConfig {
 
   return {
     pipe: normalizePipePath(pipe),
-    token,
     transport,
     httpPort,
-    httpToken,
   };
 }
 
 class UE4SSBridgeClient {
-  constructor(private readonly pipePath: string, private readonly token: string) {}
+  constructor(private readonly pipePath: string) {}
 
   call(method: string, params: Record<string, unknown> = {}): Promise<JsonValue> {
     const id = randomUUID();
-    const request = JSON.stringify({ id, token: this.token, method, params }) + "\n";
+    const request = JSON.stringify({ id, method, params }) + "\n";
 
     return new Promise<JsonValue>((resolve, reject) => {
       const socket = net.createConnection(this.pipePath);
@@ -441,14 +432,6 @@ async function runHttp(server: McpServer, config: CliConfig) {
       res.writeHead(403).end("Forbidden origin");
       return;
     }
-    if (config.httpToken) {
-      const expected = `Bearer ${config.httpToken}`;
-      if (req.headers.authorization !== expected) {
-        res.writeHead(401).end("Unauthorized");
-        return;
-      }
-    }
-
     try {
       await transport.handleRequest(req, res);
     } catch (error) {
@@ -464,7 +447,7 @@ async function runHttp(server: McpServer, config: CliConfig) {
 
 async function main() {
   const config = readConfig();
-  const bridge = new UE4SSBridgeClient(config.pipe, config.token);
+  const bridge = new UE4SSBridgeClient(config.pipe);
   const server = createServer(bridge);
 
   if (config.transport === "http") {
