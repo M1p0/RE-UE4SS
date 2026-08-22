@@ -47,6 +47,95 @@ namespace RC::MCP
     {
         constexpr DWORD BUFFER_SIZE = 64 * 1024;
         constexpr auto REQUEST_TIMEOUT = std::chrono::seconds{10};
+        constexpr DWORD PIPE_IO_STOP_POLL_MS = 50;
+
+        struct ActivePipeState
+        {
+            std::mutex mutex{};
+            HANDLE handle{INVALID_HANDLE_VALUE};
+        };
+
+        auto active_pipe_state() -> ActivePipeState&
+        {
+            // This state must outlive the function-static Server singleton: Server's
+            // destructor may still call stop during process teardown.
+            static auto* state = new ActivePipeState{};
+            return *state;
+        }
+
+        auto publish_active_pipe(HANDLE pipe) -> bool
+        {
+            auto& state = active_pipe_state();
+            std::lock_guard lock{state.mutex};
+            if (state.handle != INVALID_HANDLE_VALUE)
+            {
+                return false;
+            }
+            state.handle = pipe;
+            return true;
+        }
+
+        auto cancel_active_pipe_io() -> void
+        {
+            auto& state = active_pipe_state();
+            std::lock_guard lock{state.mutex};
+            if (state.handle == INVALID_HANDLE_VALUE)
+            {
+                return;
+            }
+
+            // CancelIoEx covers an operation issued by the server thread. Disconnecting
+            // additionally makes a connected peer's blocked read/write fail promptly.
+            // The state lock is also held by close_active_pipe, so HANDLE reuse cannot
+            // turn this cancellation into an operation on an unrelated kernel object.
+            CancelIoEx(state.handle, nullptr);
+            DisconnectNamedPipe(state.handle);
+        }
+
+        auto close_active_pipe(HANDLE pipe) -> void
+        {
+            auto& state = active_pipe_state();
+            std::lock_guard lock{state.mutex};
+            if (state.handle == pipe)
+            {
+                state.handle = INVALID_HANDLE_VALUE;
+            }
+
+            DisconnectNamedPipe(pipe);
+            CloseHandle(pipe);
+        }
+
+        auto wait_for_pipe_io(HANDLE pipe,
+                              OVERLAPPED& operation,
+                              std::stop_token token,
+                              const std::atomic_bool& running,
+                              DWORD& transferred) -> bool
+        {
+            bool cancellation_requested{};
+            for (;;)
+            {
+                if (!cancellation_requested
+                    && (token.stop_requested() || !running.load(std::memory_order_acquire)))
+                {
+                    CancelIoEx(pipe, &operation);
+                    cancellation_requested = true;
+                }
+
+                const auto wait_result = WaitForSingleObject(operation.hEvent, PIPE_IO_STOP_POLL_MS);
+                if (wait_result == WAIT_OBJECT_0)
+                {
+                    return GetOverlappedResult(pipe, &operation, &transferred, FALSE) != FALSE;
+                }
+                if (wait_result == WAIT_FAILED)
+                {
+                    // OVERLAPPED storage must remain alive until the kernel has completed
+                    // cancellation, even on an unexpected event-wait failure.
+                    CancelIoEx(pipe, &operation);
+                    GetOverlappedResult(pipe, &operation, &transferred, TRUE);
+                    return false;
+                }
+            }
+        }
 
         auto json_escape(std::string_view input) -> std::string
         {
@@ -512,18 +601,16 @@ namespace RC::MCP
         }
 
         uninstall_game_thread_pump();
+        // Queued dispatches must be completed as cancellations before join. Otherwise
+        // the pipe thread waits for REQUEST_TIMEOUT and the old closures can execute
+        // after a later restart reinstalls the game-thread pump.
+        drain_game_thread_tasks();
 
         if (m_thread.joinable())
         {
             m_thread.request_stop();
-            if (!m_pipe_path.empty())
-            {
-                const auto pipe = CreateFileA(m_pipe_path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-                if (pipe != INVALID_HANDLE_VALUE)
-                {
-                    CloseHandle(pipe);
-                }
-            }
+            cancel_active_pipe_io();
+            CancelSynchronousIo(m_thread.native_handle());
             m_thread.join();
         }
 
@@ -545,7 +632,7 @@ namespace RC::MCP
         while (!token.stop_requested() && m_running.load(std::memory_order_acquire))
         {
             const auto pipe = CreateNamedPipeA(m_pipe_path.c_str(),
-                                              PIPE_ACCESS_DUPLEX,
+                                              PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                                               PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                                               1,
                                               BUFFER_SIZE,
@@ -560,14 +647,52 @@ namespace RC::MCP
                 continue;
             }
 
-            const BOOL connected = ConnectNamedPipe(pipe, nullptr) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
-            if (connected && m_running.load(std::memory_order_acquire))
+            if (!publish_active_pipe(pipe))
+            {
+                audit("server", "error", "another pipe instance is still active");
+                CloseHandle(pipe);
+                break;
+            }
+
+            bool connected{};
+            if (!token.stop_requested() && m_running.load(std::memory_order_acquire))
+            {
+                OVERLAPPED connect_operation{};
+                connect_operation.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+                if (connect_operation.hEvent == nullptr)
+                {
+                    audit("server", "error", "CreateEvent for ConnectNamedPipe failed");
+                }
+                else if (ConnectNamedPipe(pipe, &connect_operation))
+                {
+                    connected = true;
+                }
+                else
+                {
+                    const auto connect_error = GetLastError();
+                    if (connect_error == ERROR_PIPE_CONNECTED)
+                    {
+                        connected = true;
+                    }
+                    else if (connect_error == ERROR_IO_PENDING)
+                    {
+                        DWORD ignored{};
+                        connected = wait_for_pipe_io(pipe, connect_operation, token, m_running, ignored);
+                    }
+                }
+
+                if (connect_operation.hEvent != nullptr)
+                {
+                    CloseHandle(connect_operation.hEvent);
+                }
+            }
+
+            if (connected && !token.stop_requested() && m_running.load(std::memory_order_acquire))
             {
                 serve_client(pipe);
             }
 
-            DisconnectNamedPipe(pipe);
-            CloseHandle(pipe);
+            close_active_pipe(pipe);
         }
     }
 
@@ -576,12 +701,34 @@ namespace RC::MCP
         const auto pipe = static_cast<HANDLE>(pipe_handle);
         std::string pending{};
         std::array<char, BUFFER_SIZE> buffer{};
-
-        for (;;)
+        const auto io_event = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+        if (io_event == nullptr)
         {
+            audit("server", "error", "CreateEvent for client I/O failed");
+            return;
+        }
+
+        while (m_running.load(std::memory_order_acquire))
+        {
+            ResetEvent(io_event);
+            OVERLAPPED read_operation{};
+            read_operation.hEvent = io_event;
             DWORD bytes_read{};
-            const BOOL ok = ReadFile(pipe, buffer.data(), static_cast<DWORD>(buffer.size()), &bytes_read, nullptr);
-            if (!ok || bytes_read == 0 || !m_running.load(std::memory_order_acquire))
+            const BOOL read_started = ReadFile(pipe, buffer.data(), static_cast<DWORD>(buffer.size()), nullptr, &read_operation);
+            if (!read_started && GetLastError() != ERROR_IO_PENDING)
+            {
+                break;
+            }
+            if (!read_started
+                && !wait_for_pipe_io(pipe, read_operation, {}, m_running, bytes_read))
+            {
+                break;
+            }
+            if (read_started && !GetOverlappedResult(pipe, &read_operation, &bytes_read, FALSE))
+            {
+                break;
+            }
+            if (bytes_read == 0 || !m_running.load(std::memory_order_acquire))
             {
                 break;
             }
@@ -606,17 +753,50 @@ namespace RC::MCP
                 {
                     continue;
                 }
+                if (!m_running.load(std::memory_order_acquire))
+                {
+                    CloseHandle(io_event);
+                    return;
+                }
 
                 auto response = process_line(line);
                 response.push_back('\n');
-
-                DWORD bytes_written{};
-                if (!WriteFile(pipe, response.data(), static_cast<DWORD>(response.size()), &bytes_written, nullptr))
+                if (!m_running.load(std::memory_order_acquire))
                 {
+                    CloseHandle(io_event);
+                    return;
+                }
+
+                ResetEvent(io_event);
+                OVERLAPPED write_operation{};
+                write_operation.hEvent = io_event;
+                DWORD bytes_written{};
+                const BOOL write_started = WriteFile(pipe, response.data(), static_cast<DWORD>(response.size()), nullptr, &write_operation);
+                if (!write_started && GetLastError() != ERROR_IO_PENDING)
+                {
+                    CloseHandle(io_event);
+                    return;
+                }
+                if (!write_started
+                    && !wait_for_pipe_io(pipe, write_operation, {}, m_running, bytes_written))
+                {
+                    CloseHandle(io_event);
+                    return;
+                }
+                if (write_started && !GetOverlappedResult(pipe, &write_operation, &bytes_written, FALSE))
+                {
+                    CloseHandle(io_event);
+                    return;
+                }
+                if (!m_running.load(std::memory_order_acquire))
+                {
+                    CloseHandle(io_event);
                     return;
                 }
             }
         }
+
+        CloseHandle(io_event);
     }
 
     auto Server::process_line(std::string_view line) -> std::string
@@ -651,7 +831,12 @@ namespace RC::MCP
         catch (const std::exception& e)
         {
             audit("request", "error", e.what());
-            return make_error(id_json, "bridge_error", e.what());
+            const std::string_view message{e.what()};
+            const auto code = message == "game_thread_dispatch_timeout"
+                    || message == "game_thread_dispatch_cancelled"
+                    ? message
+                    : std::string_view{"bridge_error"};
+            return make_error(id_json, code, message);
         }
     }
 
@@ -662,6 +847,8 @@ namespace RC::MCP
             std::mutex mutex{};
             std::condition_variable cv{};
             bool done{false};
+            bool cancelled{false};
+            bool started{false};
             std::string result{};
             std::exception_ptr exception{};
         };
@@ -670,18 +857,46 @@ namespace RC::MCP
 
         {
             std::lock_guard guard{m_game_thread_task_mutex};
+            if (!m_running.load(std::memory_order_acquire))
+            {
+                throw std::runtime_error{"game_thread_dispatch_cancelled"};
+            }
             m_game_thread_tasks.emplace_back([this, method = std::move(method), params_json = std::move(params_json), state]() mutable {
+                bool should_execute{};
+                {
+                    std::lock_guard state_guard{state->mutex};
+                    if (state->cancelled || !m_running.load(std::memory_order_acquire))
+                    {
+                        state->cancelled = true;
+                        state->done = true;
+                    }
+                    else
+                    {
+                        state->started = true;
+                        should_execute = true;
+                    }
+                }
+                if (!should_execute)
+                {
+                    state->cv.notify_one();
+                    return;
+                }
+
+                std::string result{};
+                std::exception_ptr exception{};
                 try
                 {
-                    state->result = handle_request(method, params_json);
+                    result = handle_request(method, params_json);
                 }
                 catch (...)
                 {
-                    state->exception = std::current_exception();
+                    exception = std::current_exception();
                 }
 
                 {
                     std::lock_guard state_guard{state->mutex};
+                    state->result = std::move(result);
+                    state->exception = std::move(exception);
                     state->done = true;
                 }
                 state->cv.notify_one();
@@ -691,7 +906,15 @@ namespace RC::MCP
         std::unique_lock lock{state->mutex};
         if (!state->cv.wait_for(lock, REQUEST_TIMEOUT, [&] { return state->done; }))
         {
-            throw std::runtime_error{"request_timeout"};
+            if (!state->started)
+            {
+                state->cancelled = true;
+            }
+            throw std::runtime_error{"game_thread_dispatch_timeout"};
+        }
+        if (state->cancelled)
+        {
+            throw std::runtime_error{"game_thread_dispatch_cancelled"};
         }
 
         if (state->exception)
