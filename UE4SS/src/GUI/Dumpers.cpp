@@ -8,12 +8,18 @@
 #include <File/File.hpp>
 #include <File/Macros.hpp>
 #include <GUI/Dumpers.hpp>
+#include <JMapGenerator/JMapGenerator.hpp>
 #include <USMapGenerator/Generator.hpp>
 #include <FlagsStringifier.hpp>
 #ifdef TEXT
 #undef TEXT
 #endif
 #include <SDKGenerator/TMapOverrideGen.hpp>
+#include <SDKGenerator/BuiltinSDKBackend.hpp>
+#include <SDKGenerator/SDKGenerator.hpp>
+#include <Timer/ScopedTimer.hpp>
+#include <Unreal/FAssetData.hpp>
+#include <Unreal/UAssetRegistry.hpp>
 #include <UE4SSProgram.hpp>
 #include <Unreal/AActor.hpp>
 #include <Unreal/NameTypes.hpp>
@@ -328,7 +334,7 @@ namespace RC::GUI::Dumpers
             auto& name_components = name_json["Components"];
             name_components["ComparisonIndex"] = name.GetComparisonIndex().ToUnstableInt();
 #ifdef WITH_CASE_PRESERVING_NAME
-            name_components["DisplayIndex"] = name.GetDisplayIndex();
+            name_components["DisplayIndex"] = name.GetDisplayIndex().ToUnstableInt();
 #else
             name_components["DisplayIndex"] = nullptr;
 #endif
@@ -473,6 +479,145 @@ namespace RC::GUI::Dumpers
         Output::send(STR("Finished dumping object as JSON\n"));
     }
 
+    using SDKGeneratorBackends = std::vector<std::pair<std::string, UEGenerator::SDKBackendSettings>>;
+
+    // Blueprint classes, structs and enums only exist in memory once their asset has been loaded, so a
+    // dump taken at the main menu sees almost none of them. Force-loading everything first makes the
+    // dump complete at the cost of a lot of memory and stability -- see the warning below -- so it is
+    // opt-in per dump rather than a setting.
+    //
+    // Runs 'dump' with every asset loaded, then releases them again. The release runs even if the dump
+    // throws, because leaving the game holding every asset is far worse than losing the dump.
+    template <typename Callable>
+    static auto run_with_all_assets_loaded(Callable&& dump) -> void
+    {
+        if (Unreal::Version::IsBelow(4, 17) || !Unreal::bFAssetDataAvailable)
+        {
+            Output::send<LogLevel::Warning>(STR("FAssetData is not available in this game, dumping without force-loading assets.\n"));
+            dump();
+            return;
+        }
+
+        Output::send(STR("Loading all assets...\n"));
+        double asset_loading_duration{};
+        {
+            ScopedTimer loading_timer{&asset_loading_duration};
+            UAssetRegistry::LoadAllAssets();
+        }
+        Output::send(STR("Loading all assets took {} seconds\n"), asset_loading_duration);
+
+        // Anything that force-loads assets leaves the game in a state it was never meant to be in;
+        // the game is likely to crash if play continues past this point.
+        struct AssetReleaseGuard
+        {
+            ~AssetReleaseGuard()
+            {
+                Output::send(STR("Unloading all forcefully loaded assets\n"));
+                UAssetRegistry::FreeAllForcefullyLoadedAssets();
+            }
+        } release_guard{};
+
+        dump();
+    }
+
+    // Converts a parsed backend description into the wide-string form the generator consumes.
+    static auto sdk_backend_from_ascii(const UEGenerator::SDKBackendSettings_ASCII& settings_ascii) -> UEGenerator::SDKBackendSettings
+    {
+        UEGenerator::SDKBackendSettings settings{};
+        settings.IncludePrefix = to_wstring(settings_ascii.IncludePrefix.value);
+        settings.HeaderFileExtension = to_wstring(settings_ascii.HeaderFileExtension.value);
+        settings.UnrealImplementationNamespace = to_wstring(settings_ascii.UnrealImplementationNamespace.value);
+        settings.SDKNamespace = to_wstring(settings_ascii.SDKNamespace.value);
+        for (const auto& setting : settings_ascii.ExcludedTypes.value)
+        {
+            settings.ExcludedTypes.emplace(to_wstring(setting));
+        }
+        for (const auto& [key, value] : settings_ascii.UnreflectedTypes.value)
+        {
+            settings.UnreflectedTypes.emplace(to_wstring(key), to_wstring(value));
+        }
+        return settings;
+    }
+
+    // Adds a backend under 'name', replacing any existing entry of the same name so that a backend
+    // found on disk overrides the compiled-in one instead of appearing twice in the list.
+    static auto add_or_replace_sdk_backend(SDKGeneratorBackends& backends, std::string name, UEGenerator::SDKBackendSettings settings) -> void
+    {
+        for (auto& [existing_name, existing_settings] : backends)
+        {
+            if (existing_name == name)
+            {
+                existing_settings = std::move(settings);
+                return;
+            }
+        }
+        backends.emplace_back(std::move(name), std::move(settings));
+    }
+
+    // Seeds 'backends' with the compiled-in UE4SS backend, then loads every backend description file
+    // from <working_dir>/UE4SS_SDK_Backends over the top of it. The entry at index 0 is the
+    // "no backend selected" placeholder and is always kept.
+    static auto load_sdk_generator_backends(SDKGeneratorBackends& backends) -> void
+    {
+        static constexpr auto glz_opts = glz::opts{
+                .format = glz::JSON,
+                .comments = false,              // Support reading in JSONC style comments
+                .error_on_unknown_keys = false, // Error when an unknown key is encountered
+                .skip_null_members = true,      // Skip writing out params in an object if the value is null
+                .prettify = true,               // Write out prettified JSON
+                .indentation_char = ' ',        // Prettified JSON indentation char
+                .indentation_width = 3,         // Prettified JSON indentation size
+                // Require all non nullable keys to be present in the object.
+                .error_on_missing_keys = false,
+                .quoted_num = false, // treat numbers as quoted or array-like types as having quoted numbers
+                .number = false,     // read numbers as strings and write these string as numbers
+                .raw = false,        // write out string like values without quotes
+        };
+
+        // Compiled-in backend first, so the generator is usable with nothing on disk.
+        {
+            UEGenerator::SDKBackendSettings_ASCII settings_ascii{};
+            std::string settings_buffer{UEGenerator::g_builtin_ue4ss_backend_json};
+            auto ec = glz::read<glz_opts>(settings_ascii, settings_buffer);
+            if (ec)
+            {
+                Output::send<LogLevel::Error>(STR("Error '{}' while reading the built-in SDK generator backend\n"),
+                                              to_wstring(glz::format_error(ec, settings_buffer)));
+            }
+            else
+            {
+                add_or_replace_sdk_backend(backends, std::string{UEGenerator::g_builtin_ue4ss_backend_name}, sdk_backend_from_ascii(settings_ascii));
+            }
+        }
+
+        const auto backends_path = std::filesystem::path{UE4SSProgram::get_program().get_working_directory()} / "UE4SS_SDK_Backends";
+        if (!std::filesystem::exists(backends_path))
+        {
+            return;
+        }
+
+        for (const auto& item : std::filesystem::directory_iterator(backends_path))
+        {
+            if (item.is_directory())
+            {
+                continue;
+            }
+
+            UEGenerator::SDKBackendSettings_ASCII settings_ascii{};
+            std::string settings_buffer{};
+            auto ec = glz::read_file_json<glz_opts, UEGenerator::SDKBackendSettings_ASCII>(settings_ascii, item.path().string(), settings_buffer);
+            if (ec)
+            {
+                Output::send<LogLevel::Error>(STR("Error '{}' while trying to read JSON: '{}'\n"),
+                                              to_wstring(glz::format_error(ec, settings_buffer)),
+                                              item.path().wstring());
+                continue;
+            }
+
+            add_or_replace_sdk_backend(backends, item.path().stem().string(), sdk_backend_from_ascii(settings_ascii));
+        }
+    }
+
     auto render() -> void
     {
         if (!UnrealInitializer::StaticStorage::bIsInitialized)
@@ -519,12 +664,51 @@ namespace RC::GUI::Dumpers
             });
         }*/
 
+        static bool s_include_blueprint_types{true};
+        static bool s_skip_property_values{false};
+        static bool s_load_all_assets_first{false};
+
+        auto run_dump = [](auto&& dump) {
+            if (s_load_all_assets_first)
+            {
+                run_with_all_assets_loaded(dump);
+            }
+            else
+            {
+                dump();
+            }
+        };
+
         if (ImGui::Button("Generate .usmap file\nUnrealMappingsDumper by OutTheShade"))
         {
-            TRY([] {
-                OutTheShade::generate_usmap();
+            TRY([&] {
+                run_dump([] {
+                    OutTheShade::generate_usmap(s_include_blueprint_types);
+                });
             });
         }
+        ImGui::SameLine();
+        if (ImGui::Button("Generate .jmap file\njmap format by trumank"))
+        {
+            TRY([&] {
+                run_dump([] {
+                    JMapGenerator::generate_jmap(s_include_blueprint_types, s_skip_property_values);
+                });
+            });
+        }
+        ImGui::SameLine();
+        ImGui::BeginGroup();
+        ImGui::Checkbox("Include Blueprint-generated types", &s_include_blueprint_types);
+        ImGui::Checkbox("Skip property values (.jmap, smaller output)", &s_skip_property_values);
+        ImGui::Checkbox("Load all assets first", &s_load_all_assets_first);
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("Applies to the .usmap, .jmap and BP SDK dumps below.\n"
+                              "Force-loads every asset so Blueprint types are present in the dump.\n"
+                              "Can need several GB of extra memory, and the game is likely to crash\n"
+                              "if you keep playing afterwards.");
+        }
+        ImGui::EndGroup();
 
         if (ImGui::Button("Generate TMapOverride file\n"))
         {
@@ -555,5 +739,48 @@ namespace RC::GUI::Dumpers
                 UE4SSProgram::get_program().generate_lua_types(working_dir + STR("\\Mods\\shared\\types"));
             });
         }
+
+        static SDKGeneratorBackends s_sdk_generator_backends{{"Select Backend", {}}};
+        static bool s_has_cached_cxx_sdk_backends{};
+        static size_t s_selected_backend_index{};
+
+        if (!s_has_cached_cxx_sdk_backends)
+        {
+            s_has_cached_cxx_sdk_backends = true;
+            TRY([] {
+                load_sdk_generator_backends(s_sdk_generator_backends);
+            });
+        }
+
+        ImGui::SetNextItemWidth(260.0f);
+        if (ImGui::BeginCombo("##cxx_sdk_generator_backend_combo", s_sdk_generator_backends[s_selected_backend_index].first.c_str()))
+        {
+            for (const auto& [backend, i] : s_sdk_generator_backends | views::enumerate)
+            {
+                const auto is_selected = s_selected_backend_index == i;
+                if (ImGui::Selectable(backend.first.c_str(), is_selected))
+                {
+                    s_selected_backend_index = i;
+                }
+                if (is_selected)
+                {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(s_selected_backend_index == 0);
+        if (ImGui::Button("Generate BP SDK"))
+        {
+            TRY([&] {
+                run_dump([] {
+                    auto& selected_backend = s_sdk_generator_backends[s_selected_backend_index];
+                    UEGenerator::generate_sdk(std::filesystem::path{UE4SSProgram::get_program().get_working_directory()} / "UE4SS_SDK",
+                                              selected_backend.second);
+                });
+            });
+        }
+        ImGui::EndDisabled();
     }
 } // namespace RC::GUI::Dumpers

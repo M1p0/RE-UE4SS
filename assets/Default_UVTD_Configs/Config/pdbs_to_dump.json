@@ -1,4 +1,7 @@
 [
+  "PDBs/4_07.pdb",
+  "PDBs/4_08.pdb",
+  "PDBs/4_09.pdb",
   "PDBs/4_10.pdb",
   "PDBs/4_11.pdb",
   "PDBs/4_12.pdb",
@@ -25,5 +28,6 @@
   "PDBs/5_04.pdb",
   "PDBs/5_05.pdb",
   "PDBs/5_06.pdb",
-  "PDBs/5_07.pdb"
+  "PDBs/5_07.pdb",
+  "PDBs/5_08.pdb"
 ]

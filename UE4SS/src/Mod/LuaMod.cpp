@@ -1,5 +1,6 @@
 #define NOMINMAX
 
+#include <algorithm>
 #include <atomic>
 #include <filesystem>
 #include <format>
@@ -8,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <ExceptionHandling.hpp>
@@ -32,6 +34,7 @@
 #pragma warning(disable : 4005)
 #include <GUI/Dumpers.hpp>
 #include <UE4SSProgram.hpp>
+#include <JMapGenerator/JMapGenerator.hpp>
 #include <USMapGenerator/Generator.hpp>
 #include <Unreal/Core/HAL/Platform.hpp>
 #include <Unreal/FFrame.hpp>
@@ -128,104 +131,106 @@ namespace RC
 
     static auto lua_unreal_script_function_hook_pre(Unreal::UnrealScriptFunctionCallableContext context, void* custom_data) -> void
     {
-        // Fetch the data corresponding to this UFunction
-        auto& lua_data = *static_cast<LuaUnrealScriptFunctionData*>(custom_data);
+        TRY([&]() {
+            // Fetch the data corresponding to this UFunction
+            auto& lua_data = *static_cast<LuaUnrealScriptFunctionData*>(custom_data);
 
-        // Check if this hook has been scheduled for removal (Lua state may be invalid)
-        if (lua_data.scheduled_for_removal) return;
+            // Check if this hook has been scheduled for removal (Lua state may be invalid)
+            if (lua_data.scheduled_for_removal) return;
 
-        // Use the stored registry index to put a Lua function on the Lua stack
-        // This is the function that was provided by the Lua call to "RegisterHook"
-        lua_data.lua.registry().get_function_ref(lua_data.lua_callback_ref);
+            // Use the stored registry index to put a Lua function on the Lua stack
+            // This is the function that was provided by the Lua call to "RegisterHook"
+            lua_data.lua.registry().get_function_ref(lua_data.lua_callback_ref);
 
-        // Set up the first param (context / this-ptr)
-        // TODO: Check what happens if a static UFunction is hooked since they don't have any context
-        static auto s_object_property_name = Unreal::FName(STR("ObjectProperty"), Unreal::FNAME_Find);
-        LuaType::RemoteUnrealParam::construct(lua_data.lua, &context.Context, s_object_property_name);
+            // Set up the first param (context / this-ptr)
+            // TODO: Check what happens if a static UFunction is hooked since they don't have any context
+            static auto s_object_property_name = Unreal::FName(STR("ObjectProperty"), Unreal::FNAME_Find);
+            LuaType::RemoteUnrealParam::construct(lua_data.lua, &context.Context, s_object_property_name);
 
-        // Attempt at dynamically fetching the params
-        const auto FunctionBeingExecuted = lua_data.unreal_function;
-        uint16_t return_value_offset = FunctionBeingExecuted->GetReturnValueOffset();
+            // Attempt at dynamically fetching the params
+            const auto FunctionBeingExecuted = lua_data.unreal_function;
+            uint16_t return_value_offset = FunctionBeingExecuted->GetReturnValueOffset();
 
-        // 'ReturnValueOffset' is 0xFFFF if the UFunction return type is void
-        lua_data.has_return_value = return_value_offset != 0xFFFF;
+            // 'ReturnValueOffset' is 0xFFFF if the UFunction return type is void
+            lua_data.has_return_value = return_value_offset != 0xFFFF;
 
-        uint8_t num_unreal_params = FunctionBeingExecuted->GetNumParms();
-        if (lua_data.has_return_value)
-        {
-            // Subtract one from the number of params if there's a return value
-            // This is because Unreal treats the return value as a param, and it's included in the 'NumParms' member variable
-            --num_unreal_params;
-        }
-
-        bool has_properties_to_process = lua_data.has_return_value || num_unreal_params > 0;
-        if (has_properties_to_process && (context.TheStack.Locals() || context.TheStack.OutParms()))
-        {
-            // int32_t current_param_offset{};
-
-            for (Unreal::FProperty* func_prop : Unreal::TFieldRange<Unreal::FProperty>(FunctionBeingExecuted, Unreal::EFieldIterationFlags::IncludeDeprecated))
+            uint8_t num_unreal_params = FunctionBeingExecuted->GetNumParms();
+            if (lua_data.has_return_value)
             {
-                // Skip this property if it's not a parameter
-                if (!func_prop->HasAnyPropertyFlags(Unreal::EPropertyFlags::CPF_Parm))
-                {
-                    continue;
-                }
+                // Subtract one from the number of params if there's a return value
+                // This is because Unreal treats the return value as a param, and it's included in the 'NumParms' member variable
+                --num_unreal_params;
+            }
 
-                // Skip if this property corresponds to the return value
-                if (lua_data.has_return_value && func_prop->GetOffset_Internal() == return_value_offset)
-                {
-                    lua_data.return_property = func_prop;
-                    continue;
-                }
+            bool has_properties_to_process = lua_data.has_return_value || num_unreal_params > 0;
+            if (has_properties_to_process && (context.TheStack.Locals() || context.TheStack.OutParms()))
+            {
+                // int32_t current_param_offset{};
 
-                Unreal::FName property_type = func_prop->GetClass().GetFName();
-                int32_t name_comparison_index = property_type.GetComparisonIndex();
-
-                if (LuaType::StaticState::m_property_value_pushers.contains(name_comparison_index))
+                for (Unreal::FProperty* func_prop : Unreal::TFieldRange<Unreal::FProperty>(FunctionBeingExecuted, Unreal::EFieldIterationFlags::IncludeDeprecated))
                 {
-                    // Non-typed pointer to the current parameter value
-                    void* data{};
-                    if (func_prop->HasAnyPropertyFlags(Unreal::EPropertyFlags::CPF_OutParm))
+                    // Skip this property if it's not a parameter
+                    if (!func_prop->HasAnyPropertyFlags(Unreal::EPropertyFlags::CPF_Parm))
                     {
-                        data = Unreal::FindOutParamValueAddress(context.TheStack, func_prop);
+                        continue;
+                    }
+
+                    // Skip if this property corresponds to the return value
+                    if (lua_data.has_return_value && func_prop->GetOffset_Internal() == return_value_offset)
+                    {
+                        lua_data.return_property = func_prop;
+                        continue;
+                    }
+
+                    Unreal::FName property_type = func_prop->GetClass().GetFName();
+                    int32_t name_comparison_index = property_type.GetComparisonIndex();
+
+                    if (LuaType::StaticState::m_property_value_pushers.contains(name_comparison_index))
+                    {
+                        // Non-typed pointer to the current parameter value
+                        void* data{};
+                        if (func_prop->HasAnyPropertyFlags(Unreal::EPropertyFlags::CPF_OutParm))
+                        {
+                            data = Unreal::FindOutParamValueAddress(context.TheStack, func_prop);
+                        }
+                        else
+                        {
+                            data = func_prop->ContainerPtrToValuePtr<void>(context.TheStack.Locals());
+                        }
+
+                        // Keeping track of where in the 'Locals' array the next property is
+                        // current_param_offset += func_prop->GetSize();
+
+                        // Set up a call to a handler for this type of Unreal property (the param)
+                        // The FName is being used as a key for an unordered_map which has the types & corresponding handlers filled right after the dll is injected
+                        const LuaType::PusherParams pusher_params{.operation = LuaType::Operation::GetParam,
+                                                                  .lua = lua_data.lua,
+                                                                  .base = nullptr,
+                                                                  .data = data,
+                                                                  .property = func_prop};
+                        LuaType::StaticState::m_property_value_pushers[name_comparison_index](pusher_params);
                     }
                     else
                     {
-                        data = func_prop->ContainerPtrToValuePtr<void>(context.TheStack.Locals());
+                        lua_data.lua.throw_error(fmt::format(
+                                "[unreal_script_function_hook] Tried accessing unreal property without a registered handler. Property type '{}' not supported.",
+                                to_string(property_type.ToString())));
                     }
-
-                    // Keeping track of where in the 'Locals' array the next property is
-                    // current_param_offset += func_prop->GetSize();
-
-                    // Set up a call to a handler for this type of Unreal property (the param)
-                    // The FName is being used as a key for an unordered_map which has the types & corresponding handlers filled right after the dll is injected
-                    const LuaType::PusherParams pusher_params{.operation = LuaType::Operation::GetParam,
-                                                              .lua = lua_data.lua,
-                                                              .base = nullptr,
-                                                              .data = data,
-                                                              .property = func_prop};
-                    LuaType::StaticState::m_property_value_pushers[name_comparison_index](pusher_params);
-                }
-                else
-                {
-                    lua_data.lua.throw_error(fmt::format(
-                            "[unreal_script_function_hook] Tried accessing unreal property without a registered handler. Property type '{}' not supported.",
-                            to_string(property_type.ToString())));
                 }
             }
-        }
 
-        // Call the Lua function with the correct number of parameters & return values
-        // Increasing the 'num_params' by one to account for the 'this / context' param
-        lua_data.lua.call_function(num_unreal_params + 1, 1);
+            // Call the Lua function with the correct number of parameters & return values
+            // Increasing the 'num_params' by one to account for the 'this / context' param
+            lua_data.lua.call_function(num_unreal_params + 1, 1);
 
-        // The params for the Lua script will be 'userdata' and they will have get/set functions
-        // Use these functions in the Lua script to access & mutate the parameter values
+            // The params for the Lua script will be 'userdata' and they will have get/set functions
+            // Use these functions in the Lua script to access & mutate the parameter values
 
-        // After the Lua function has been executed you should call the original function
-        // This will execute any internal UE4 scripting functions & native functions depending on the type of UFunction
-        // The API will automatically call the original function
-        // This function continues in 'lua_unreal_script_function_hook_post' which executes immediately after the original function gets called
+            // After the Lua function has been executed you should call the original function
+            // This will execute any internal UE4 scripting functions & native functions depending on the type of UFunction
+            // The API will automatically call the original function
+            // This function continues in 'lua_unreal_script_function_hook_post' which executes immediately after the original function gets called
+        });
     }
 
     static auto lua_unreal_script_function_hook_post(Unreal::UnrealScriptFunctionCallableContext context, void* custom_data) -> void
@@ -270,160 +275,163 @@ namespace RC
             return;
         }
 
-        auto process_return_value = [&]() {
-            // If 'nil' exists on the Lua stack, that means that the UFunction expected a return value but the Lua script didn't return anything
-            // So we can simply clean the stack and let the UFunction decide the return value on its own
-            if (lua_data.lua.is_nil())
-            {
-                lua_data.lua.discard_value();
-            }
-            else if (lua_data.lua.get_stack_size() > 0 && lua_data.has_return_value && lua_data.return_property && context.RESULT_DECL)
-            {
-                // Fetch the return value from Lua if the UFunction expects one
-                // If no return value exists then assume that the Lua script didn't want to override the original
-                // Keep in mind that the if this was a Blueprint UFunction then the entire byte-code will already have executed
-                // That means that changing the return value here won't affect the script itself
-                // If this was a native UFunction then changing the return value here will have the desired effect
-
-                Unreal::FName property_type_name = lua_data.return_property->GetClass().GetFName();
-                int32_t name_comparison_index = property_type_name.GetComparisonIndex();
-
-                if (LuaType::StaticState::m_property_value_pushers.contains(name_comparison_index))
+        TRY([&]() {
+            auto process_return_value = [&]() {
+                // If 'nil' exists on the Lua stack, that means that the UFunction expected a return value but the Lua script didn't return anything
+                // So we can simply clean the stack and let the UFunction decide the return value on its own
+                if (lua_data.lua.is_nil())
                 {
-                    const LuaType::PusherParams pusher_params{.operation = LuaType::Operation::Set,
-                                                              .lua = lua_data.lua,
-                                                              .base = static_cast<Unreal::UObject*>(context.RESULT_DECL),
-                                                              .data = context.RESULT_DECL,
-                                                              .property = lua_data.return_property};
-                    LuaType::StaticState::m_property_value_pushers[name_comparison_index](pusher_params);
-                }
-                else
-                {
-                    // If the type wasn't supported then we simply clean the Lua stack, output a warning and then do nothing
                     lua_data.lua.discard_value();
-
-                    auto parameter_type_name = property_type_name.ToString();
-                    auto parameter_name = lua_data.return_property->GetName();
-
-                    Output::send(
-                            STR("Tried altering return value of a hooked UFunction without a registered handler for return type Return property '{}' of type "
-                                "'{}' not supported."),
-                            parameter_name,
-                            parameter_type_name);
                 }
-            }
-        };
-
-        if (lua_data.lua_post_callback_ref != -1)
-        {
-            // Use the stored registry index to put a Lua function on the Lua stack
-            // This is the function that was provided by the Lua call to "RegisterHook"
-            lua_data.lua.registry().get_function_ref(lua_data.lua_post_callback_ref);
-
-            // Set up the first param (context / this-ptr)
-            static auto s_object_property_name = Unreal::FName(STR("ObjectProperty"), Unreal::FNAME_Find);
-            LuaType::RemoteUnrealParam::construct(lua_data.lua, &context.Context, s_object_property_name);
-
-            // Attempt at dynamically fetching the params
-            const auto FunctionBeingExecuted = lua_data.unreal_function;
-            uint16_t return_value_offset = FunctionBeingExecuted->GetReturnValueOffset();
-
-            // 'ReturnValueOffset' is 0xFFFF if the UFunction return type is void
-            lua_data.has_return_value = return_value_offset != 0xFFFF;
-
-            uint8_t num_unreal_params = FunctionBeingExecuted->GetNumParms();
-            if (lua_data.has_return_value)
-            {
-                // Subtract one from the number of params if there's a return value
-                // This is because Unreal treats the return value as a param, and it's included in the 'NumParms' member variable
-                --num_unreal_params;
-
-                // Set up the return value param so that Lua can access the original return value
-                auto return_property = FunctionBeingExecuted->GetReturnProperty();
-                auto return_property_type = return_property->GetClass().GetFName();
-                int32_t name_comparison_index = return_property_type.GetComparisonIndex();
-                if (LuaType::StaticState::m_property_value_pushers.contains(name_comparison_index))
+                else if (lua_data.lua.get_stack_size() > 0 && lua_data.has_return_value && lua_data.return_property && context.RESULT_DECL)
                 {
-                    const LuaType::PusherParams pusher_params{.operation = LuaType::Operation::GetParam,
-                                                              .lua = lua_data.lua,
-                                                              .base = nullptr,
-                                                              .data = context.RESULT_DECL,
-                                                              .property = return_property};
-                    LuaType::StaticState::m_property_value_pushers[name_comparison_index](pusher_params);
-                }
-            }
+                    // Fetch the return value from Lua if the UFunction expects one
+                    // If no return value exists then assume that the Lua script didn't want to override the original
+                    // Keep in mind that the if this was a Blueprint UFunction then the entire byte-code will already have executed
+                    // That means that changing the return value here won't affect the script itself
+                    // If this was a native UFunction then changing the return value here will have the desired effect
 
-            bool has_properties_to_process = lua_data.has_return_value || num_unreal_params > 0;
-            if (has_properties_to_process && context.TheStack.Locals())
-            {
-                for (Unreal::FProperty* func_prop : Unreal::TFieldRange<Unreal::FProperty>(FunctionBeingExecuted, Unreal::EFieldIterationFlags::IncludeDeprecated))
-                {
-                    // Skip this property if it's not a parameter
-                    if (!func_prop->HasAnyPropertyFlags(Unreal::EPropertyFlags::CPF_Parm))
-                    {
-                        continue;
-                    }
-
-                    // Skip if this property corresponds to the return value
-                    if (lua_data.has_return_value && func_prop->GetOffset_Internal() == return_value_offset)
-                    {
-                        lua_data.return_property = func_prop;
-                        continue;
-                    }
-
-                    Unreal::FName property_type = func_prop->GetClass().GetFName();
-                    int32_t name_comparison_index = property_type.GetComparisonIndex();
+                    Unreal::FName property_type_name = lua_data.return_property->GetClass().GetFName();
+                    int32_t name_comparison_index = property_type_name.GetComparisonIndex();
 
                     if (LuaType::StaticState::m_property_value_pushers.contains(name_comparison_index))
                     {
-                        // Non-typed pointer to the current parameter value
-                        void* data{};
-                        if (func_prop->HasAnyPropertyFlags(Unreal::EPropertyFlags::CPF_OutParm))
-                        {
-                            // For out params (including ref params), get the modified value from OutParms
-                            data = Unreal::FindOutParamValueAddress(context.TheStack, func_prop);
-                        }
-                        else
-                        {
-                            // For regular input params, read from Locals
-                            data = func_prop->ContainerPtrToValuePtr<void>(context.TheStack.Locals());
-                        }
-
-                        // Keeping track of where in the 'Locals' array the next property is
-                        // current_param_offset += func_prop->GetSize();
-
-                        // Set up a call to a handler for this type of Unreal property (the param)
-                        // The FName is being used as a key for an unordered_map which has the types & corresponding handlers filled right after the dll is injected
-                        const LuaType::PusherParams pusher_params{.operation = LuaType::Operation::GetParam,
+                        const LuaType::PusherParams pusher_params{.operation = LuaType::Operation::Set,
                                                                   .lua = lua_data.lua,
-                                                                  .base = nullptr,
-                                                                  .data = data,
-                                                                  .property = func_prop};
+                                                                  .base = static_cast<Unreal::UObject*>(context.RESULT_DECL),
+                                                                  .data = context.RESULT_DECL,
+                                                                  .property = lua_data.return_property};
                         LuaType::StaticState::m_property_value_pushers[name_comparison_index](pusher_params);
                     }
                     else
                     {
-                        lua_data.lua.throw_error(fmt::format(
-                                "[unreal_script_function_hook] Tried accessing unreal property without a registered handler. Property type '{}' not supported.",
-                                to_string(property_type.ToString())));
+                        // If the type wasn't supported then we simply clean the Lua stack, output a warning and then do nothing
+                        lua_data.lua.discard_value();
+
+                        auto parameter_type_name = property_type_name.ToString();
+                        auto parameter_name = lua_data.return_property->GetName();
+
+                        Output::send(
+                                STR("Tried altering return value of a hooked UFunction without a registered handler for return type Return property '{}' of type "
+                                    "'{}' not supported."),
+                                parameter_name,
+                                parameter_type_name);
                     }
                 }
+            };
+
+            if (lua_data.lua_post_callback_ref != -1)
+            {
+                // Use the stored registry index to put a Lua function on the Lua stack
+                // This is the function that was provided by the Lua call to "RegisterHook"
+                lua_data.lua.registry().get_function_ref(lua_data.lua_post_callback_ref);
+
+                // Set up the first param (context / this-ptr)
+                static auto s_object_property_name = Unreal::FName(STR("ObjectProperty"), Unreal::FNAME_Find);
+                LuaType::RemoteUnrealParam::construct(lua_data.lua, &context.Context, s_object_property_name);
+
+                // Attempt at dynamically fetching the params
+                const auto FunctionBeingExecuted = lua_data.unreal_function;
+                uint16_t return_value_offset = FunctionBeingExecuted->GetReturnValueOffset();
+
+                // 'ReturnValueOffset' is 0xFFFF if the UFunction return type is void
+                lua_data.has_return_value = return_value_offset != 0xFFFF;
+
+                uint8_t num_unreal_params = FunctionBeingExecuted->GetNumParms();
+                if (lua_data.has_return_value)
+                {
+                    // Subtract one from the number of params if there's a return value
+                    // This is because Unreal treats the return value as a param, and it's included in the 'NumParms' member variable
+                    --num_unreal_params;
+
+                    // Set up the return value param so that Lua can access the original return value
+                    auto return_property = FunctionBeingExecuted->GetReturnProperty();
+                    auto return_property_type = return_property->GetClass().GetFName();
+                    int32_t name_comparison_index = return_property_type.GetComparisonIndex();
+                    if (LuaType::StaticState::m_property_value_pushers.contains(name_comparison_index))
+                    {
+                        const LuaType::PusherParams pusher_params{.operation = LuaType::Operation::GetParam,
+                                                                  .lua = lua_data.lua,
+                                                                  .base = nullptr,
+                                                                  .data = context.RESULT_DECL,
+                                                                  .property = return_property};
+                        LuaType::StaticState::m_property_value_pushers[name_comparison_index](pusher_params);
+                    }
+                }
+
+                bool has_properties_to_process = lua_data.has_return_value || num_unreal_params > 0;
+                if (has_properties_to_process && context.TheStack.Locals())
+                {
+                    for (Unreal::FProperty* func_prop : Unreal::TFieldRange<Unreal::FProperty>(FunctionBeingExecuted, Unreal::EFieldIterationFlags::IncludeDeprecated))
+                    {
+                        // Skip this property if it's not a parameter
+                        if (!func_prop->HasAnyPropertyFlags(Unreal::EPropertyFlags::CPF_Parm))
+                        {
+                            continue;
+                        }
+
+                        // Skip if this property corresponds to the return value
+                        if (lua_data.has_return_value && func_prop->GetOffset_Internal() == return_value_offset)
+                        {
+                            lua_data.return_property = func_prop;
+                            continue;
+                        }
+
+                        Unreal::FName property_type = func_prop->GetClass().GetFName();
+                        int32_t name_comparison_index = property_type.GetComparisonIndex();
+
+                        if (LuaType::StaticState::m_property_value_pushers.contains(name_comparison_index))
+                        {
+                            // Non-typed pointer to the current parameter value
+                            void* data{};
+                            if (func_prop->HasAnyPropertyFlags(Unreal::EPropertyFlags::CPF_OutParm))
+                            {
+                                // For out params (including ref params), get the modified value from OutParms
+                                data = Unreal::FindOutParamValueAddress(context.TheStack, func_prop);
+                            }
+                            else
+                            {
+                                // For regular input params, read from Locals
+                                data = func_prop->ContainerPtrToValuePtr<void>(context.TheStack.Locals());
+                            }
+
+                            // Keeping track of where in the 'Locals' array the next property is
+                            // current_param_offset += func_prop->GetSize();
+
+                            // Set up a call to a handler for this type of Unreal property (the param)
+                            // The FName is being used as a key for an unordered_map which has the types & corresponding handlers filled right after the dll is injected
+                            const LuaType::PusherParams pusher_params{.operation = LuaType::Operation::GetParam,
+                                                                      .lua = lua_data.lua,
+                                                                      .base = nullptr,
+                                                                      .data = data,
+                                                                      .property = func_prop};
+                            LuaType::StaticState::m_property_value_pushers[name_comparison_index](pusher_params);
+                        }
+                        else
+                        {
+                            lua_data.lua.throw_error(fmt::format(
+                                    "[unreal_script_function_hook] Tried accessing unreal property without a registered handler. Property type '{}' not supported.",
+                                    to_string(property_type.ToString())));
+                        }
+                    }
+                }
+
+                // Call the Lua function with the correct number of parameters & return values
+                // Increasing the 'num_params' by one to account for the 'this / context' param
+                // Increasing it again if there's a return value because we store that as the second param
+                lua_data.lua.call_function(num_unreal_params + (lua_data.has_return_value ? 2 : 1), 1);
             }
 
-            // Call the Lua function with the correct number of parameters & return values
-            // Increasing the 'num_params' by one to account for the 'this / context' param
-            // Increasing it again if there's a return value because we store that as the second param
-            lua_data.lua.call_function(num_unreal_params + (lua_data.has_return_value ? 2 : 1), 1);
-        }
-
-        // Processing potential return values from both callbacks.
-        // Stack pos 1: return value from callback 1 (nil if nothing returned)
-        // Stack pos 2: return value from callback 2
-        // We will always have at leaste two return values, either one can be nil, and we need to process both in case one isn't nil.
-        process_return_value();
-        process_return_value();
+            // Processing potential return values from both callbacks.
+            // Stack pos 1: return value from callback 1 (nil if nothing returned)
+            // Stack pos 2: return value from callback 2
+            // We will always have at leaste two return values, either one can be nil, and we need to process both in case one isn't nil.
+            process_return_value();
+            process_return_value();
+        });
 
         // Removes pre & post-hook callbacks if UnregisterHook was called in the post-hook callback.
+        // Deliberately outside the TRY so the hooks still get removed when the callback throws.
         remove_if_scheduled();
     }
 
@@ -1869,8 +1877,28 @@ Overloads:
                 return 0;
             });
 
-            lua.register_function("DumpUSMAP", []([[maybe_unused]] const LuaMadeSimple::Lua& lua) -> int {
-                OutTheShade::generate_usmap();
+            lua.register_function("DumpUSMAP", [](const LuaMadeSimple::Lua& lua) -> int {
+                bool include_blueprint_types{true};
+                if (lua.is_bool())
+                {
+                    include_blueprint_types = lua.get_bool();
+                }
+                OutTheShade::generate_usmap(include_blueprint_types);
+                return 0;
+            });
+
+            lua.register_function("DumpJMAP", [](const LuaMadeSimple::Lua& lua) -> int {
+                bool include_blueprint_types{true};
+                if (lua.is_bool())
+                {
+                    include_blueprint_types = lua.get_bool();
+                }
+                bool skip_property_values{false};
+                if (lua.is_bool())
+                {
+                    skip_property_values = lua.get_bool();
+                }
+                JMapGenerator::generate_jmap(include_blueprint_types, skip_property_values);
                 return 0;
             });
         }
@@ -2626,52 +2654,112 @@ Overloads:
 
             auto game_name = game_executable_directory.parent_path().parent_path().filename();
             auto game_root_directory = game_executable_directory.parent_path().parent_path().parent_path();
+
+            // A C function only gets LUA_MINSTACK (20) free slots and each level below holds two of them until
+            // fuse_pair() runs, so a deep tree pushes past the end of the stack. api_incr_top's check is compiled
+            // out in release, so it corrupts the heap instead of erroring.
+            constexpr int32_t lua_stack_slots_per_level = 8;
+            constexpr size_t max_directory_depth = 64;
+
             auto directories_table = lua.prepare_new_table();
 
-            std::function<void(const std::filesystem::path&, LuaMadeSimple::Lua::Table&)> iterate_directory =
-                    [&](const std::filesystem::path& directory, LuaMadeSimple::Lua::Table& current_directory_table) {
+            bool reported_depth_limit{};
+            // Link targets on the current path. Every cycle goes through a link, so this breaks them all without
+            // resolving the non-link entries.
+            std::vector<std::filesystem::path> followed_links{};
+
+            std::function<void(const std::filesystem::path&, LuaMadeSimple::Lua::Table&, size_t)> iterate_directory =
+                    [&](const std::filesystem::path& directory, LuaMadeSimple::Lua::Table& current_directory_table, size_t depth) {
                         try
                         {
-                            std::error_code ec;
-                            for (const auto& item : std::filesystem::directory_iterator(directory, ec))
+                            if (!lua_checkstack(lua.get_lua_state(), lua_stack_slots_per_level))
                             {
-                                try
+                                Output::send<LogLevel::Error>(STR("IterateGameDirectories: Could not grow the Lua stack while iterating {}, "
+                                                                  "stopping traversal here\n"),
+                                                              directory.wstring());
+                                return;
+                            }
+
+                            if (depth >= max_directory_depth)
+                            {
+                                if (!reported_depth_limit)
                                 {
-                                    if (!item.is_directory())
+                                    reported_depth_limit = true;
+                                    Output::send<LogLevel::Warning>(STR("IterateGameDirectories: Reached the maximum directory depth of {} at {}. "
+                                                                        "Directories below this are not included in the result.\n"),
+                                                                    max_directory_depth,
+                                                                    directory.wstring());
+                                }
+                            }
+                            else
+                            {
+                                std::error_code ec;
+                                for (const auto& item :
+                                     std::filesystem::directory_iterator(directory, std::filesystem::directory_options::skip_permission_denied, ec))
+                                {
+                                    std::error_code item_ec;
+                                    if (!item.is_directory(item_ec) || item_ec)
                                     {
                                         continue;
                                     }
 
-                                    auto path = item.path().filename();
-
-                                    // Set key to "Game" if this is the game directory, otherwise use the actual name
-                                    std::string table_key;
-                                    if (path == game_name)
+                                    bool following_link{};
+                                    if (item.is_symlink(item_ec) && !item_ec)
                                     {
-                                        table_key = "Game";
+                                        auto link_target = std::filesystem::canonical(item.path(), item_ec);
+                                        if (item_ec)
+                                        {
+                                            // Can't check an unresolvable link for a cycle, so don't descend into it.
+                                            continue;
+                                        }
+
+                                        if (std::find(followed_links.begin(), followed_links.end(), link_target) != followed_links.end())
+                                        {
+                                            continue;
+                                        }
+
+                                        followed_links.emplace_back(std::move(link_target));
+                                        following_link = true;
                                     }
-                                    else
+
+                                    try
                                     {
-                                        // TODO: When UE5 String conversion is implemented, replace with StringCast<ANSICHAR>
-                                        table_key = to_utf8_string(path);
+                                        auto path = item.path().filename();
+
+                                        // Set key to "Game" if this is the game directory, otherwise use the actual name
+                                        std::string table_key;
+                                        if (path == game_name)
+                                        {
+                                            table_key = "Game";
+                                        }
+                                        else
+                                        {
+                                            // TODO: When UE5 String conversion is implemented, replace with StringCast<ANSICHAR>
+                                            table_key = to_utf8_string(path);
+                                        }
+
+                                        current_directory_table.add_key(table_key.c_str());
+                                        auto next_directory_table = lua.prepare_new_table();
+
+                                        // Recursively iterate the subdirectory
+                                        iterate_directory(item.path(), next_directory_table, depth + 1);
+                                        current_directory_table.fuse_pair();
+                                    }
+                                    catch (const std::exception& e)
+                                    {
+                                        Output::send<LogLevel::Error>(STR("Error processing directory entry: {}\n"), to_wstring(e.what()));
                                     }
 
-                                    current_directory_table.add_key(table_key.c_str());
-                                    auto next_directory_table = lua.prepare_new_table();
-
-                                    // Recursively iterate the subdirectory
-                                    iterate_directory(item.path(), next_directory_table);
-                                    current_directory_table.fuse_pair();
+                                    if (following_link)
+                                    {
+                                        followed_links.pop_back();
+                                    }
                                 }
-                                catch (const std::exception& e)
+
+                                if (ec)
                                 {
-                                    Output::send<LogLevel::Error>(STR("Error processing directory entry: {}\n"), to_wstring(e.what()));
+                                    Output::send<LogLevel::Error>(STR("Error iterating directory {}: {}\n"), directory.wstring(), to_wstring(ec.message()));
                                 }
-                            }
-
-                            if (ec)
-                            {
-                                Output::send<LogLevel::Error>(STR("Error iterating directory {}: {}\n"), directory.wstring(), to_wstring(ec.message()));
                             }
 
                             auto meta_table = lua.prepare_new_table();
@@ -2790,24 +2878,38 @@ Overloads:
                                             std::error_code ec;
                                             if (std::filesystem::exists(path_wstr, ec))
                                             {
-                                                for (const auto& item : std::filesystem::directory_iterator(path_wstr, ec))
+                                                for (const auto& item :
+                                                     std::filesystem::directory_iterator(path_wstr, std::filesystem::directory_options::skip_permission_denied, ec))
                                                 {
                                                     try
                                                     {
-                                                        if (!item.is_directory())
+                                                        std::error_code item_ec;
+                                                        if (item.is_directory(item_ec) || item_ec)
                                                         {
-                                                            files_table.add_key(index);
-                                                            auto file_table = lua.prepare_new_table();
-
-                                                            // Create safe strings for filenames and paths
-                                                            // TODO: When UE5 String conversion is implemented, replace with StringCast<ANSICHAR>
-                                                            std::string safe_filename = to_utf8_string(item.path().filename());
-                                                            std::string safe_path = to_utf8_string(item.path());
-
-                                                            file_table.add_pair("__name", safe_filename.c_str());
-                                                            file_table.add_pair("__absolute_path", safe_path.c_str());
-                                                            files_table.fuse_pair();
+                                                            continue;
                                                         }
+
+                                                        if (!lua_checkstack(lua_state, 5))
+                                                        {
+                                                            Output::send<LogLevel::Error>(STR("Error iterating files in {}: could not grow the Lua stack\n"),
+                                                                                          path_wstr);
+                                                            break;
+                                                        }
+
+                                                        files_table.add_key(index);
+                                                        auto file_table = lua.prepare_new_table();
+
+                                                        // Create safe strings for filenames and paths
+                                                        // TODO: When UE5 String conversion is implemented, replace with StringCast<ANSICHAR>
+                                                        std::string safe_filename = to_utf8_string(item.path().filename());
+                                                        std::string safe_path = to_utf8_string(item.path());
+
+                                                        file_table.add_pair("__name", safe_filename.c_str());
+                                                        file_table.add_pair("__absolute_path", safe_path.c_str());
+                                                        files_table.fuse_pair();
+
+                                                        // Only advance when something was added, otherwise skipped
+                                                        // directories leave holes and '#files' stops being usable.
                                                         ++index;
                                                     }
                                                     catch (const std::exception& e)
@@ -2856,7 +2958,7 @@ Overloads:
 
             try
             {
-                iterate_directory(game_root_directory, directories_table);
+                iterate_directory(game_root_directory, directories_table, 0);
             }
             catch (const std::exception& e)
             {
@@ -3701,8 +3803,8 @@ Overloads:
             }
 
             LuaMod::m_is_currently_executing_game_action = true;
-            lua_data.lua->registry().get_function_ref(lua_data.lua_action_function_ref);
             TRY([&]() {
+                lua_data.lua->registry().get_function_ref(lua_data.lua_action_function_ref);
                 lua_data.lua->call_function(0, 0);
             });
             luaL_unref(lua_data.lua->get_lua_state(), LUA_REGISTRYINDEX, lua_data.lua_action_function_ref);
@@ -3910,8 +4012,8 @@ Overloads:
             }
 
             LuaMod::m_is_currently_executing_game_action = true;
-            exec.lua->registry().get_function_ref(exec.lua_action_function_ref);
             TRY([&]() {
+                exec.lua->registry().get_function_ref(exec.lua_action_function_ref);
                 exec.lua->call_function(0, 0);
             });
             LuaMod::m_is_currently_executing_game_action = false;
@@ -5968,6 +6070,22 @@ Overloads:
         }
     }
 
+    auto LuaMod::fire_on_lua_stop_for_self() -> void
+    {
+        if (!is_started())
+        {
+            return;
+        }
+
+        if (m_on_unload_lua_function_ref != LUA_NOREF && m_on_unload_lua_function_ref != LUA_REFNIL)
+        {
+            TRY([&]() {
+                lua().registry().get_function_ref(m_on_unload_lua_function_ref);
+                lua().call_function(0, 0);
+            });
+        }
+    }
+
     auto LuaMod::uninstall() -> void
     {
         Output::send(STR("Stopping mod '{}' for uninstall\n"), m_mod_name);
@@ -5984,6 +6102,7 @@ Overloads:
         std::lock_guard<std::recursive_mutex> guard{LuaMod::m_thread_actions_mutex};
 
         fire_on_lua_stop_for_cpp_mods();
+        fire_on_lua_stop_for_self();
 
         erase_from_container(this, m_static_construct_object_lua_callbacks);
         m_pending_notify_on_new_object_callbacks.clear();
@@ -6186,105 +6305,120 @@ Overloads:
                         continue;
                     }
 
-                    lua.registry().get_function_ref(registry_index.lua_index);
-
-                    static auto s_object_property_name = Unreal::FName(STR("ObjectProperty"), Unreal::FNAME_Find);
-                    LuaType::RemoteUnrealParam::construct(lua, &Context, s_object_property_name);
-
-                    auto node = Stack.Node();
-                    auto return_value_offset = node->GetReturnValueOffset();
-                    auto has_return_value = return_value_offset != 0xFFFF;
-                    auto num_unreal_params = node->GetNumParms();
-                    if (has_return_value && num_unreal_params > 0)
+                    // Guard each callback separately so a throwing hook can't skip the remaining callbacks or escape into the hook layer.
+                    const auto stack_top_before_callback = lua_gettop(lua.get_lua_state());
+                    try
                     {
-                        --num_unreal_params;
-                    }
+                        lua.registry().get_function_ref(registry_index.lua_index);
 
-                    if (has_return_value || num_unreal_params > 0)
-                    {
-                        for (Unreal::FProperty* param : Unreal::TFieldRange<Unreal::FProperty>(node, Unreal::EFieldIterationFlags::IncludeDeprecated))
+                        static auto s_object_property_name = Unreal::FName(STR("ObjectProperty"), Unreal::FNAME_Find);
+                        LuaType::RemoteUnrealParam::construct(lua, &Context, s_object_property_name);
+
+                        auto node = Stack.Node();
+                        auto return_value_offset = node->GetReturnValueOffset();
+                        auto has_return_value = return_value_offset != 0xFFFF;
+                        auto num_unreal_params = node->GetNumParms();
+                        if (has_return_value && num_unreal_params > 0)
                         {
-                            if (!param->HasAnyPropertyFlags(Unreal::EPropertyFlags::CPF_Parm))
-                            {
-                                continue;
-                            }
-                            if (has_return_value && param->GetOffset_Internal() == return_value_offset)
-                            {
-                                continue;
-                            }
+                            --num_unreal_params;
+                        }
 
-                            auto param_type = param->GetClass().GetFName();
-                            auto param_type_comparison_index = param_type.GetComparisonIndex();
-                            if (auto it = LuaType::StaticState::m_property_value_pushers.find(param_type_comparison_index);
-                                it != LuaType::StaticState::m_property_value_pushers.end())
+                        if (has_return_value || num_unreal_params > 0)
+                        {
+                            for (Unreal::FProperty* param : Unreal::TFieldRange<Unreal::FProperty>(node, Unreal::EFieldIterationFlags::IncludeDeprecated))
                             {
-                                void* data{};
-                                if (param->HasAnyPropertyFlags(Unreal::EPropertyFlags::CPF_OutParm))
+                                if (!param->HasAnyPropertyFlags(Unreal::EPropertyFlags::CPF_Parm))
                                 {
-                                    data = Unreal::FindOutParamValueAddress(Stack, param);
+                                    continue;
+                                }
+                                if (has_return_value && param->GetOffset_Internal() == return_value_offset)
+                                {
+                                    continue;
+                                }
+
+                                auto param_type = param->GetClass().GetFName();
+                                auto param_type_comparison_index = param_type.GetComparisonIndex();
+                                if (auto it = LuaType::StaticState::m_property_value_pushers.find(param_type_comparison_index);
+                                    it != LuaType::StaticState::m_property_value_pushers.end())
+                                {
+                                    void* data{};
+                                    if (param->HasAnyPropertyFlags(Unreal::EPropertyFlags::CPF_OutParm))
+                                    {
+                                        data = Unreal::FindOutParamValueAddress(Stack, param);
+                                    }
+                                    else
+                                    {
+                                        data = param->ContainerPtrToValuePtr<void>(Stack.Locals());
+                                    }
+                                    const LuaType::PusherParams pusher_param{
+                                            .operation = LuaType::Operation::GetParam,
+                                            .lua = lua,
+                                            .base = nullptr,
+                                            .data = data,
+                                            .property = param,
+                                    };
+                                    auto& type_handler = it->second;
+                                    type_handler(pusher_param);
                                 }
                                 else
                                 {
-                                    data = param->ContainerPtrToValuePtr<void>(Stack.Locals());
+                                    lua.throw_error(fmt::format(
+                                            "[script_hook] Tried accessing unreal property without a registered handler. Property type '{}' not supported.",
+                                            to_string(param_type.ToString())));
                                 }
-                                const LuaType::PusherParams pusher_param{
-                                        .operation = LuaType::Operation::GetParam,
-                                        .lua = lua,
-                                        .base = nullptr,
-                                        .data = data,
-                                        .property = param,
-                                };
-                                auto& type_handler = it->second;
-                                type_handler(pusher_param);
-                            }
-                            else
-                            {
-                                lua.throw_error(fmt::format(
-                                        "[script_hook] Tried accessing unreal property without a registered handler. Property type '{}' not supported.",
-                                        to_string(param_type.ToString())));
-                            }
-                        };
-                    }
+                            };
+                        }
 
-                    lua.call_function(num_unreal_params + 1, 1);
+                        lua.call_function(num_unreal_params + 1, 1);
 
-                    bool return_value_handled{};
-                    if (has_return_value && RESULT_DECL && lua.get_stack_size() > 0 && !lua.is_nil())
-                    {
-                        auto return_property = node->GetReturnProperty();
-                        if (return_property)
+                        bool return_value_handled{};
+                        if (has_return_value && RESULT_DECL && lua.get_stack_size() > 0 && !lua.is_nil())
                         {
-                            auto return_property_type = return_property->GetClass().GetFName();
-                            auto return_property_type_comparison_index = return_property_type.GetComparisonIndex();
-
-                            if (auto it = LuaType::StaticState::m_property_value_pushers.find(return_property_type_comparison_index);
-                                it != LuaType::StaticState::m_property_value_pushers.end())
+                            auto return_property = node->GetReturnProperty();
+                            if (return_property)
                             {
-                                const LuaType::PusherParams pusher_params{.operation = LuaType::Operation::Set,
-                                                                          .lua = lua,
-                                                                          .base = static_cast<Unreal::UObject*>(RESULT_DECL),
-                                                                          .data = RESULT_DECL,
-                                                                          .property = return_property};
-                                auto& type_handler = it->second;
-                                type_handler(pusher_params);
-                                return_value_handled = true;
-                            }
-                            else
-                            {
-                                auto return_property_type_name = return_property_type.ToString();
-                                auto return_property_name = return_property->GetName();
+                                auto return_property_type = return_property->GetClass().GetFName();
+                                auto return_property_type_comparison_index = return_property_type.GetComparisonIndex();
 
-                                Output::send(STR("Tried altering return value of a custom BP function without a registered handler for return type Return "
-                                                 "property '{}' of type '{}' not supported."),
-                                             return_property_name,
-                                             return_property_type_name);
+                                if (auto it = LuaType::StaticState::m_property_value_pushers.find(return_property_type_comparison_index);
+                                    it != LuaType::StaticState::m_property_value_pushers.end())
+                                {
+                                    const LuaType::PusherParams pusher_params{.operation = LuaType::Operation::Set,
+                                                                              .lua = lua,
+                                                                              .base = static_cast<Unreal::UObject*>(RESULT_DECL),
+                                                                              .data = RESULT_DECL,
+                                                                              .property = return_property};
+                                    auto& type_handler = it->second;
+                                    type_handler(pusher_params);
+                                    return_value_handled = true;
+                                }
+                                else
+                                {
+                                    auto return_property_type_name = return_property_type.ToString();
+                                    auto return_property_name = return_property->GetName();
+
+                                    Output::send(STR("Tried altering return value of a custom BP function without a registered handler for return type Return "
+                                                     "property '{}' of type '{}' not supported."),
+                                                 return_property_name,
+                                                 return_property_type_name);
+                                }
                             }
                         }
-                    }
 
-                    if (!return_value_handled)
+                        if (!return_value_handled)
+                        {
+                            lua.discard_value();
+                        }
+                    }
+                    catch (std::exception& e)
                     {
-                        lua.discard_value();
+                        lua_settop(lua.get_lua_state(), stack_top_before_callback);
+                        Output::send<LogLevel::Error>(STR("[script_hook] A callback threw an exception: {}\n"), ensure_str(e.what()));
+                    }
+                    catch (...)
+                    {
+                        lua_settop(lua.get_lua_state(), stack_top_before_callback);
+                        Output::send<LogLevel::Error>(STR("[script_hook] A callback threw a non-standard exception\n"));
                     }
                 }
             }
@@ -7131,11 +7265,16 @@ Overloads:
                                                                async_lua()->call_function(0, 0);
                                                            }
                                                        }
-                                                       catch (std::runtime_error& e)
+                                                       catch (std::exception& e)
                                                        {
                                                            Output::send(STR("[{}] {}\n"),
                                                                         ensure_str(action.type == LuaMod::ActionType::Loop ? "LoopAsync" : "DelayedAction"),
                                                                         ensure_str(e.what()));
+                                                       }
+                                                       catch (...)
+                                                       {
+                                                           Output::send(STR("[{}] Unknown exception\n"),
+                                                                        ensure_str(action.type == LuaMod::ActionType::Loop ? "LoopAsync" : "DelayedAction"));
                                                        }
 
                                                        return result;
@@ -7154,6 +7293,11 @@ Overloads:
         m_pending_actions.clear();
         m_delayed_actions.clear();
         actions_unlock();
+    }
+
+    auto LuaMod::set_on_unload_callback(int32_t ref) -> void
+    {
+        m_on_unload_lua_function_ref = ref;
     }
 } // namespace RC
 

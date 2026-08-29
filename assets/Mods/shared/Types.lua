@@ -303,7 +303,12 @@ function DumpStaticMeshes() end
 function DumpAllActors() end
 
 --- Generates .usmap file
-function DumpUSMAP() end
+---@param IncludeBlueprintTypes boolean? Whether to include Blueprint-generated classes/structs/enums (default: true)
+function DumpUSMAP(IncludeBlueprintTypes) end
+
+--- Generates .jmap file (JSON reflection dump, format by trumank)
+---@param IncludeBlueprintTypes boolean? Whether to include Blueprint-generated classes/structs/enums (default: true)
+function DumpJMAP(IncludeBlueprintTypes) end
 
 ---@param ObjectName string
 ---@return UObject
@@ -1551,3 +1556,26 @@ ThreadId = {}
 ---Returns the thread id as a string
 ---@return string
 function ThreadId:ToString() end
+
+---@class ModRef
+ModRef = {}
+
+---Registers a callback which is called when the mod is unloaded
+---@param Callback fun()
+function ModRef:OnUnload(Callback) end
+
+---Sets a variable that can be accessed by any mod.
+---The second parameter Value can only be one of the following types:
+---nil, string, number, bool, UObject (+derivatives), lightuserdata.
+---@param VariableName: string
+---@param Value: any
+function ModRef:SetSharedVariable(VariableName, Value) end
+
+---Returns a variable that could’ve been set from another mod.
+---The return value can only be one of the following types: nil, string, number, bool, UObject(+derivatives), lightuserdata.
+---@return any
+function ModRef:GetSharedVariable() end
+
+---Returns "ModRef"
+---@return 'ModRef'
+function ModRef:type() end

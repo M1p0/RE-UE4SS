@@ -12,6 +12,7 @@
 - [Blueprint Modloading](./feature-overview/blueprint-modloader.md)
 - [Live Property Viewer and Editor](./feature-overview/live-view.md)
 - [Dumpers](./feature-overview/dumpers.md)
+- [SDK Generator](./feature-overview/sdk-generator.md)
 
 ## APIs
 
@@ -109,6 +110,7 @@
     - [DumpStaticMeshes](./lua-api/global-functions/dumpstaticmeshes.md)
     - [DumpAllActors](./lua-api/global-functions/dumpallactors.md)
     - [DumpUSMAP](./lua-api/global-functions/dumpusmap.md)
+    - [DumpJMAP](./lua-api/global-functions/dumpjmap.md)
     - [LoadExport](./lua-api/global-functions/loadexport.md)
     - [Mod Management](./lua-api/global-functions/modmanagement.md)
   - [Examples](./lua-api/examples.md)

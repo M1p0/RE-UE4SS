@@ -132,12 +132,16 @@ namespace RC
         REGISTER_BOOL_SETTING(UHTHeaderGenerator.MakeEnumClassesBlueprintType, section_uht_header_generator, MakeEnumClassesBlueprintType)
         REGISTER_BOOL_SETTING(UHTHeaderGenerator.MakeAllConfigsEngineConfig, section_uht_header_generator, MakeAllConfigsEngineConfig)
 
+        constexpr static File::CharType section_sdkgenerator[] = STR("SDKGenerator");
+        REGISTER_STRING_SETTING(SDKGenerator.OutputPath, section_sdkgenerator, OutputPath)
+
         constexpr static File::CharType section_debug[] = STR("Debug");
         REGISTER_BOOL_SETTING(Debug.SimpleConsoleEnabled, section_debug, ConsoleEnabled)
         REGISTER_INT64_SETTING(Debug.SimpleConsoleCodePage, section_debug, ConsoleCodePage)
         REGISTER_BOOL_SETTING(Debug.DebugConsoleEnabled, section_debug, GuiConsoleEnabled)
         REGISTER_BOOL_SETTING(Debug.DebugConsoleVisible, section_debug, GuiConsoleVisible)
         REGISTER_FLOAT_SETTING(Debug.DebugGUIFontScaling, section_debug, GuiConsoleFontScaling)
+        REGISTER_BOOL_SETTING(Debug.DebugGUIUseMonospace, section_debug, GuiConsoleMonospaceTextEditors)
         StringType graphics_api_string{};
         REGISTER_STRING_SETTING(graphics_api_string, section_debug, GraphicsAPI)
         if (String::iequal(graphics_api_string, STR("DX11")) || String::iequal(graphics_api_string, STR("D3D11")))
@@ -161,6 +165,20 @@ namespace RC
         else if (String::iequal(render_mode_string, STR("GameViewportClientTick")))
         {
             Debug.RenderMode = GUI::RenderMode::GameViewportClientTick;
+        }
+        StringType toggle_gui_key{};
+        REGISTER_STRING_SETTING(toggle_gui_key, section_debug, ToggleGuiKey)
+        if (!toggle_gui_key.empty())
+        {
+            try
+            {
+                Debug.ToggleGUIKey = Input::string_to_key(toggle_gui_key);
+            }
+            catch (...)
+            {
+                // Note that this happens too early to be sent to the log file or the GUI, so it will only appear in the native console on Win32, or the terminal on Linux.
+                throw std::runtime_error{fmt::format("Invalid value for 'Debug.ToggleGUIKey': {}\n", to_string(toggle_gui_key))};
+            }
         }
 
         constexpr static File::CharType section_crash_dump[] = STR("CrashDump");
