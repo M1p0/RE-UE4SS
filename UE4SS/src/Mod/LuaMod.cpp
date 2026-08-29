@@ -1786,6 +1786,10 @@ Overloads:
 
 
                 auto func_ptr = unreal_function->GetFunc();
+                const auto function_class_name = unreal_function->GetClassPrivate()
+                                                         ? to_string(unreal_function->GetClassPrivate()->GetName())
+                                                         : std::string{};
+                const bool is_angelscript_function = function_class_name.starts_with("ASFunction");
                 if (func_ptr && func_ptr != Unreal::UObject::ProcessInternalInternal.get_function_address() &&
                     unreal_function->HasAnyFunctionFlags(Unreal::EFunctionFlags::FUNC_Native))
                 {
@@ -1797,8 +1801,9 @@ Overloads:
                         hook_data->get()->scheduled_for_removal = true;
                     }
                 }
-                else if (func_ptr && func_ptr == Unreal::UObject::ProcessInternalInternal.get_function_address() &&
-                         !unreal_function->HasAnyFunctionFlags(Unreal::EFunctionFlags::FUNC_Native))
+                else if ((func_ptr && func_ptr == Unreal::UObject::ProcessInternalInternal.get_function_address() &&
+                          !unreal_function->HasAnyFunctionFlags(Unreal::EFunctionFlags::FUNC_Native)) ||
+                         is_angelscript_function)
                 {
                     if (auto data_ptr = LuaMod::find_function_hook_data(LuaMod::m_script_hook_callbacks, unreal_function); data_ptr)
                     {
@@ -4259,8 +4264,9 @@ Overloads:
                                                 custom_data->post_callback_id,
                                                 unreal_function->GetFullName());
             }
-            else if (func_ptr && func_ptr == Unreal::UObject::ProcessInternalInternal.get_function_address() &&
-                     !unreal_function->HasAnyFunctionFlags(Unreal::EFunctionFlags::FUNC_Native))
+            else if ((func_ptr && func_ptr == Unreal::UObject::ProcessInternalInternal.get_function_address() &&
+                      !unreal_function->HasAnyFunctionFlags(Unreal::EFunctionFlags::FUNC_Native)) ||
+                     is_angelscript_function)
             {
                 auto function_data = find_function_hook_data(m_script_hook_callbacks, unreal_function);
                 if (!function_data)
