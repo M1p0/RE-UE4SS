@@ -825,7 +825,21 @@ namespace RC::JMapGenerator
                 return it->second;
             }
 
-            std::string name = to_utf8_string(object->GetNamePrivate().ToString());
+            if (!is_live_object(object))
+            {
+                throw std::runtime_error{"cannot build path for a stale UObject at " + hex_address(reinterpret_cast<uint64_t>(object))};
+            }
+
+            const FName& object_name = object->GetNamePrivate();
+            const uint32_t comparison_index = object_name.GetComparisonIndex().ToUnstableInt();
+            if ((comparison_index & ~FNameEntryIdMask) != 0)
+            {
+                throw std::runtime_error{
+                        "cannot build path for UObject with invalid FName index " + hex_address(comparison_index) + " at "
+                        + hex_address(reinterpret_cast<uint64_t>(object))};
+            }
+
+            std::string name = to_utf8_string(object_name.ToString());
             UObject* outer = object->GetOuterPrivate();
             std::string path{};
             if (outer)
@@ -2150,7 +2164,7 @@ namespace RC::JMapGenerator
             UObjectGlobals::ForEachUObject([&](UObject* object, [[maybe_unused]] int32 object_index, [[maybe_unused]] int32 chunk_index) {
                 try
                 {
-                    if (!object || *reinterpret_cast<uint64_t*>(object) == 0 || !object->GetClassPrivate())
+                    if (!is_live_object(object) || *reinterpret_cast<uint64_t*>(object) == 0 || !object->GetClassPrivate())
                     {
                         return LoopAction::Continue;
                     }
@@ -2186,7 +2200,7 @@ namespace RC::JMapGenerator
                 UObject* object = m_extra_objects[i];
                 try
                 {
-                    if (!object || *reinterpret_cast<uint64_t*>(object) == 0 || !object->GetClassPrivate())
+                    if (!is_live_object(object) || *reinterpret_cast<uint64_t*>(object) == 0 || !object->GetClassPrivate())
                     {
                         continue;
                     }
