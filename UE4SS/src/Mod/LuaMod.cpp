@@ -4241,8 +4241,12 @@ Overloads:
             int32_t post_id{};
 
             auto func_ptr = unreal_function->GetFunc();
+            const auto function_class_name = unreal_function->GetClassPrivate()
+                                                     ? to_string(unreal_function->GetClassPrivate()->GetName())
+                                                     : std::string{};
+            const bool is_angelscript_function = function_class_name.starts_with("ASFunction");
             if (func_ptr && func_ptr != Unreal::UObject::ProcessInternalInternal.get_function_address() &&
-                unreal_function->HasAnyFunctionFlags(Unreal::EFunctionFlags::FUNC_Native))
+                (unreal_function->HasAnyFunctionFlags(Unreal::EFunctionFlags::FUNC_Native) || is_angelscript_function))
             {
                 auto& custom_data = g_hooked_script_function_data.emplace_back(std::make_unique<LuaUnrealScriptFunctionData>(
                         0, 0, unreal_function, mod, *hook_lua, lua_callback_registry_index, lua_post_callback_registry_index, lua_thread_registry_index));

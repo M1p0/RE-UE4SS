@@ -183,13 +183,14 @@ namespace RC
                                 return DidLuaScanSucceed::No;
                             }
                             Unreal::UnrealInitializer::VerifyFNameConstructor(address);
+                            constexpr auto verification_name = STR("UE4SS_FNameConstructorVerification");
                             Unreal::FName name{};
-                            SEH_TRY({ name = Unreal::FName(STR("bCanBeDamaged"), Unreal::FNAME_Find, address); })
+                            SEH_TRY({ name = Unreal::FName(verification_name, Unreal::FNAME_Add, address); })
                             SEH_EXCEPT({ Output::send<LogLevel::Error>(STR("Error: Crashed calling FName constructor.\n")); });
 
                             DidLuaScanSucceed did_succeed{};
                             SEH_TRY({
-                                if (name == STR("bCanBeDamaged"))
+                                if (name == verification_name)
                                 {
                                     Output::send(STR("FName::FName address: {} <- Lua Script\n"), address);
                                     Unreal::FName::ConstructorInternal.assign_address(address);
