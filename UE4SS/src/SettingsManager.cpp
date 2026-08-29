@@ -201,7 +201,6 @@ namespace RC
         REGISTER_BOOL_SETTING(MCP.AuditLogEnabled, section_mcp, AuditLogEnabled)
 
         constexpr static File::CharType section_hooks[] = STR("Hooks");
-        REGISTER_BOOL_SETTING(Hooks.HookStaticConstructObject, section_hooks, HookStaticConstructObject)
         REGISTER_BOOL_SETTING(Hooks.HookProcessInternal, section_hooks, HookProcessInternal)
         REGISTER_BOOL_SETTING(Hooks.HookProcessLocalScriptFunction, section_hooks, HookProcessLocalScriptFunction)
         REGISTER_BOOL_SETTING(Hooks.HookLoadMap, section_hooks, HookLoadMap)

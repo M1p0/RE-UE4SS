@@ -348,23 +348,26 @@ namespace RC::ObjectDumper
     auto init() -> void
     {
         object_to_string_functions[UEnum::StaticClass()->HashObject()] = &enum_to_string;
-        if (UUserDefinedEnum::IsStaticClassAvailable())
-        {
-            object_to_string_functions[UUserDefinedEnum::StaticClass()->HashObject()] = &enum_to_string;
-        }
+#define REGISTER_OPTIONAL_OBJECT_CLASS(Type, Function)                                                                            \
+        do                                                                                                                        \
+        {                                                                                                                         \
+            try                                                                                                                   \
+            {                                                                                                                     \
+                if (auto* object_class = Type::StaticClass())                                                                     \
+                {                                                                                                                 \
+                    object_to_string_functions[object_class->HashObject()] = Function;                                             \
+                }                                                                                                                 \
+            }                                                                                                                     \
+            catch (...)                                                                                                           \
+            {                                                                                                                     \
+            }                                                                                                                     \
+        } while (false)
+        REGISTER_OPTIONAL_OBJECT_CLASS(UUserDefinedEnum, &enum_to_string);
         object_to_string_functions[UClass::StaticClass()->HashObject()] = &struct_to_string;
-        if (UBlueprintGeneratedClass::IsStaticClassAvailable())
-        {
-            object_to_string_functions[UBlueprintGeneratedClass::StaticClass()->HashObject()] = &struct_to_string;
-        }
-        if (UWidgetBlueprintGeneratedClass::IsStaticClassAvailable())
-        {
-            object_to_string_functions[UWidgetBlueprintGeneratedClass::StaticClass()->HashObject()] = &struct_to_string;
-        }
-        if (UAnimBlueprintGeneratedClass::IsStaticClassAvailable())
-        {
-            object_to_string_functions[UAnimBlueprintGeneratedClass::StaticClass()->HashObject()] = &struct_to_string;
-        }
+        REGISTER_OPTIONAL_OBJECT_CLASS(UBlueprintGeneratedClass, &struct_to_string);
+        REGISTER_OPTIONAL_OBJECT_CLASS(UWidgetBlueprintGeneratedClass, &struct_to_string);
+        REGISTER_OPTIONAL_OBJECT_CLASS(UAnimBlueprintGeneratedClass, &struct_to_string);
+#undef REGISTER_OPTIONAL_OBJECT_CLASS
         // The 'function_to_string' function is explicitly called, so it doesn't need to be in this map.
         // object_to_string_functions[UFunction::StaticClass()->HashObject()] = &function_to_string;
         // object_to_string_functions[UDelegateFunction::StaticClass()->HashObject()] = &function_to_string;

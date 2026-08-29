@@ -958,7 +958,6 @@ namespace RC
             }
         });
 
-        config.bHookStaticConstructObject = settings_manager.Hooks.HookStaticConstructObject;
         config.bHookProcessInternal = settings_manager.Hooks.HookProcessInternal;
         config.bHookProcessLocalScriptFunction = settings_manager.Hooks.HookProcessLocalScriptFunction;
         config.bHookLoadMap = settings_manager.Hooks.HookLoadMap;
